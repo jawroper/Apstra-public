@@ -1,0 +1,230 @@
+#!/bin/bash
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--AOSip)
+            initAOSIP="$2"
+            if [ "$initAOSIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--AOSuid)
+            AOSUID="$2"
+            if [ "$AOSUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--AOSpwd)
+            AOSPWD="$2"
+            if [ "$AOSPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+          -h|--help)
+              help-info
+              exit 0
+          ;;
+          -x)
+              DEBUG=1
+              shift
+          ;;
+          -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+              JDEBUG=1
+              DEBUG=1
+              shift
+          ;;
+          *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+              shift # past argument
+          ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the AOS login information is always required
+  if [ -z "$AOSUID" ] || [ -z "$AOSIP" ] || [ -z "$AOSPWD" ]; then
+    echo ""; echo " You are missing >=1 AOS parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo ""; echo " The package \"jq\" must be installed to use this script"; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initAOSIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    AOSIP=$initAOSIP
+  else
+    echo " IP address AOS is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  Called to output uniform DEBUG messages when -x arg is passed
+#
+#####
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+#  called by main() to clear the files the "curl" statements will use for input
+#
+#####
+clear-json(){
+  rm -f -- /tmp/AOStoken.json
+  rm -f -- /tmp/qeleafs
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request AOS Token
+  cat > /tmp/AOStoken.json <<EOF
+{
+  "username":"${AOSUID}",
+  "password": "${AOSPWD}"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for AOS
+#
+#####
+get-tokens(){
+  if [ $NOTSILENT -eq 1 ]; then echo " Getting AOS Authentication Token"; fi
+  AOStoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/AOStoken.json -X POST https://$AOSIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the AOS server
+  BPlist=( $(curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints |
+          awk 'BEGIN { RS="," }; /id":/ || /label":/ { print $NF}' |
+          sed 'N;s/\n/,/' | sed -e 's/"//g') )
+  BPlistelements=${#BPlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPs) K:(BPlistelements) $BPlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPdetails(){
+  echo "Which Blueprint to copy from:"
+  for((ij=0;ij<$BPlistelements;ij++))
+  do
+    BPname=`echo "${BPlist[ij]}" | cut -d',' -f1`
+    BPUUID=`echo "${BPlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(BPname) $BPname  K:(BPUUID) $BPUUID"; fi
+
+    BPitem=( $(curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints/${BPUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPitemelements=${#BPitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(BPname) $BPname  K:(BPlistelements) $BPlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(BPname) $BPname  K:(BPitemelements) $BPitemelements"; fi
+    #do-BPdetails
+  done
+  jcnt=$(( $ij - 1 ))
+  get-BPNumber
+  fromBPname=`echo "${BPlist[fromsponse]}" | cut -d',' -f1`
+  fromBPUUID=`echo "${BPlist[fromsponse]}" | cut -d',' -f2`
+}
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPNumber(){
+  loop2=0
+  echo ""
+  echo " Which BP to use. Specify Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jcnt" ]; then
+        loop2=1
+     fi
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+do-qe-linklabel(){
+  echo " "
+  echo "    Logical Link                Leaf to Server           "
+  echo "==================== ===================================="
+  echo "{\"query\": \"match(node('system', role='leaf', name='l').out('hosted_interfaces').node('interface', name='Iface').out('link').node('link', name='Lname', role='to_generic'))\"}" > /tmp/qeleafs
+  curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X POST https://$AOSIP/api/blueprints/${fromBPUUID}/qe --data-binary @/tmp/qeleafs |
+  jq -rc '.items[] | .Lname.label, .Lname.group_label' | sed 'N;s/\n/,/' | awk 'BEGIN {FS=","} {print $NF,$1}' | sort -k 1 | cut -f1 -d '(' | awk '{printf("%-20s %-36s\n",$1,$2)}'
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+get-tokens
+get-BPlist
+get-BPdetails
+do-qe-linklabel
+if [ $DEBUG -eq 0 ]; then clear-json; fi

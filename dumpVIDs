@@ -1,0 +1,334 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: dumpVIDs
+#  PURPOSE: Used to display which VLAN_IDs are currently being used by a blueprint.
+#
+#  CREATED: 10/07/23
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 07/07/23
+#  BY: Jay A Wilson
+#  VERSION: 1.00
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+          -h|--help)
+              help-info
+              exit 0
+          ;;
+          -x)
+              DEBUG=1
+              shift
+          ;;
+          -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+              JDEBUG=1
+              DEBUG=1
+              shift
+          ;;
+          *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+              shift # past argument
+          ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool prints a listing of all VLAN IDs currently provisioned" 
+    echo "    in a Blueprint."
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Blueprint listing from Juniper Apstra"
+    echo ""
+    echo "  syntax: "
+    echo "      dumpVID -ai|--Apstraip <Apstra-ip>     *"
+    echo "              -au|--Apstrauid <Apstra-uid>   *"
+    echo "              -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "               -h|--help"
+    echo ""
+    echo "               * = required"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+  rm -f -- /tmp/ApstraTotoken.json
+  rm -f -- /tmp/rzvids
+  rm -f -- /tmp/vnvids
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+cat > /tmp/ApstraTotoken.json <<EOF
+{
+"username":"${ApstraToUID}",
+"password": "${ApstraToPWD}"
+}
+EOF
+}
+#####
+#
+#  Build the graph queries to use
+#
+#####
+build-queries(){
+  # JSON to request Apstra Token
+  cat > /tmp/rzvids <<EOF
+{
+  "query": "node('security_zone', name='vn_instance')"
+}
+EOF
+cat > /tmp/vnvids <<EOF
+{
+  "query": "node('vn_instance', name='vn_instance')"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  if [ $NOTSILENT -eq 1 ]; then echo " Getting Apstra Authentication Tokens"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to get a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the Apstra server
+  BPFlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints |
+           jq '.items[] | .label, .id' | sed 'N;s/\n/,/' | sed -e 's/ /~/g' | sed -e 's/"//g') )
+  BPFlistelements=${#BPFlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $BPFlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPFdetails(){
+  echo " From Blueprints:"
+  for((ij=0;ij<$BPFlistelements;ij++))
+  do
+    BPFname=`echo "${BPFlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    BPFUUID=`echo "${BPFlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPFname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFUUID) $BPFUUID"; fi
+
+    BPFitem=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${BPFUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPFitemelements=${#BPFitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFlistelements) $BPFlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFitemelements) $BPFitemelements"; fi
+    #do-BPdetails
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  fromBPname=`echo "${BPFlist[fromsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  fromBPUUID=`echo "${BPFlist[fromsponse]}" | cut -d',' -f2`
+}
+
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"FROM\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     case $fromsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# called by main() to get all VLAN IDs used by Security Zones
+#
+#####
+get-RZVIDs(){
+  echo ""
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-RZVIDs) K:(BPUUID) $fromBPUUID"; fi
+  #
+  # jq explained
+  #    read in each items entry
+  #    select Racks that only have 1 leaf switch in them
+  #    output only the UUIDs and the Labels of all single leaf Rack Switches
+  #
+  echo "RZ VLAN IDs currently in use:"
+  #curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/${fromBPUUID}/qe --data-binary @/tmp/rzvids
+  curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/${fromBPUUID}/qe --data-binary @/tmp/rzvids |
+  jq '.items[].vn_instance | select(.vlan_id != null) | .vlan_id' | sort -u -n
+}
+#####
+#
+# called by main() to get all VLAN IDs used by Virtual Networks
+#
+#####
+get-VNVIDs(){
+  echo ""
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNVIDs) K:(BPUUID) $fromBPUUID"; fi
+  #
+  # jq explained
+  #    read in each items entry
+  #    select Racks that only have 1 leaf switch in them
+  #    output only the UUIDs and the Labels of all single leaf Rack Switches
+  #
+  echo "VN VLAN IDs currently in use:"
+    curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/${fromBPUUID}/qe --data-binary @/tmp/vnvids |
+    jq '.items[].vn_instance | select(.vlan_id != null) | .vlan_id' | sort -u -n
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+build-queries
+get-tokens
+get-BPlist
+get-BPFdetails
+get-RZVIDs
+get-VNVIDs
+
+if [ $DEBUG -eq 0 ]; then clear-json; fi

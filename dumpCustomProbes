@@ -1,0 +1,436 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: retrieveCustomProbes
+#  PURPOSE: Used to dispaly the json for probes of type extensible_data_collector
+#
+#  CREATED: 02/12/24
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 02/12/24
+#  BY: Jay A Wilson
+#  VERSION: 1.00
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -o|--output)
+            LOGOUTPUT="$2"
+            shift # past argument
+            shift # past value
+        ;;
+          -h|--help)
+              help-info
+              exit 0
+          ;;
+          -x)
+              DEBUG=1
+              shift
+          ;;
+          -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+              JDEBUG=1
+              DEBUG=1
+              shift
+          ;;
+          *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+              shift # past argument
+          ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # need to know where to retrieve the configlet(s) too
+  if [ -n "$LOGOUTPUT" ] && [ ! -d "${LOGOUTPUT}/" ]; then
+    echo ""; echo " Output directory does not exist"; echo " ...exit()"
+    exit 1
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool prints a listing of all Extensible Data Collector"
+    echo "      probes currently provisioned in a Blueprint."
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Blueprint listing from Juniper Apstra"
+    echo ""
+    echo "  Probe names that contain <spaces> or /s will have"
+    echo "    those characters converted to a - "
+    echo ""
+    echo "  syntax: "
+    echo "      retrieveCustomProbes -ai|--Apstraip <Apstra-ip>     *"
+    echo "                           -au|--Apstrauid <Apstra-uid>   *"
+    echo "                           -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "                            -o|--output <directory>"
+    echo "                            -h|--help"
+    echo ""
+    echo "               * = required"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+}
+#####
+#
+#  Build the graph queries to use
+#
+#####
+build-queries(){
+  # JSON to request Apstra Token
+  cat > /tmp/rzvids <<EOF
+{
+  "query": "node('security_zone', name='vn_instance')"
+}
+EOF
+cat > /tmp/vnvids <<EOF
+{
+  "query": "node('vn_instance', name='vn_instance')"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to get a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the Apstra server
+  BPFlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints |
+           jq '.items[] | .label, .id' | sed 'N;s/\n/,/' | sed -e 's/ /~/g' | sed -e 's/"//g') )
+  BPFlistelements=${#BPFlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $BPFlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPFdetails(){
+  echo " From Blueprints:"
+  for((ij=0;ij<$BPFlistelements;ij++))
+  do
+    BPFname=`echo "${BPFlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    BPFUUID=`echo "${BPFlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPFname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFUUID) $BPFUUID"; fi
+
+    BPFitem=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${BPFUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPFitemelements=${#BPFitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFlistelements) $BPFlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFitemelements) $BPFitemelements"; fi
+    #do-BPdetails
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  fromBPname=`echo "${BPFlist[fromsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  fromBPUUID=`echo "${BPFlist[fromsponse]}" | cut -d',' -f2`
+}
+
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"FROM\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     case $fromsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# called by main() to get all Probes enabled in the Blueprint
+#
+#####
+get-Probes(){
+  echo ""
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Probes) K:(BPUUID) $fromBPUUID"; fi
+  #
+  # jq explained
+  #    read in each items entry
+  #    select Racks that only have 1 leaf switch in them
+  #    output only the UUIDs and the Labels of all single leaf Rack Switches
+  #
+  echo "RZ VLAN IDs currently in use:"
+  #curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/${fromBPUUID}/qe --data-binary @/tmp/rzvids
+  #curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${fromBPUUID}/probes
+  curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${fromBPUUID}/probes |
+  jq '.items[] | select(.processors[].properties.service_name == "interface_queue_drops" or .processors[].properties.service_name == "pfc_counters")'
+}
+#####
+#
+# called by main() to get a listing of all Probes
+#
+#####
+get-PROBElist(){
+  #create and array of all the Custom PROBEboards
+  #curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/$fromBPUUID/probes |
+  # jq '.items[] | select(.predefined_probe? == "") | .label, .id'
+
+  PROBEarray=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/$fromBPUUID/probes |
+   jq '.items[] | select(.predefined_probe? == "") | .label, .id' | sed 's/[ \/]/-/g' | sed 'N;s/\n/,/' | sed -e 's/"//g') )
+  # add an "all" entry as entry 0 in the array
+  PROBElist=( $(echo "retrieve-ALL-PROBES,ALLID") )
+  PROBElist+=("${PROBEarray[@]}")
+  PROBElistelements=${#PROBElist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-PROBElist) K:(PROBElistelements) $PROBElistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each Probe
+#
+#####
+get-PROBEdetails(){
+  echo "Probe to retrieve:"; echo ""
+  for((ij=0;ij<$PROBElistelements;ij++))
+  do
+    PROBEname=`echo "${PROBElist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    PROBEUUID=`echo "${PROBElist[ij]}" | cut -d',' -f2`
+    echo $ij" "$PROBEname
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-PROBEfromNumber
+  fromPROBEUUID=`echo "${PROBElist[fromNsponse]}"| cut -d',' -f2`
+  fromPROBEname=`echo "${PROBElist[fromNsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-PROBEdetails) K:(fromPROBEUUID) $fromPROBEUUID"; fi
+
+}
+#####
+#
+# called by get-PROBEdetails() to determine which Configlet to retrieve
+#
+#####
+get-PROBEfromNumber(){
+  loop2=0
+  echo ""
+  echo "Input Probe Number or Q to quit"
+  while [ $loop2 -eq 0 ]
+  do
+     read fromNsponse
+     case $fromNsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromNsponse" -ge "0" ] && [ "$fromNsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       q|Q)
+          exit
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-nodefromNumber) K:(fromNsponse) $fromNsponse"; fi
+  done
+}
+#####
+#
+# called by main() to loop through retrieveping all Configlets
+#
+#####
+retrieve-PROBEloop(){
+  echo " Retrieving Custom Probes:"
+  for((ij=1;ij<$PROBElistelements;ij++))
+  do
+    fromPROBEname=`echo "${PROBElist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    fromPROBEUUID=`echo "${PROBElist[ij]}" | cut -d',' -f2`
+    echo $ij" "$fromPROBEname
+    retrieve-PROBE
+  done
+}
+#####
+#
+# called by main() and by retrieve-PROBEloop to retrieve a single Probe
+#
+#####
+#
+# zscaler sometimes cause an "error code: 1003" to be generated, so strip it out
+#
+retrieve-PROBE(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(retrieve-PROBE) K:(PROBEUUID) $fromPROBEUUID"; fi
+  if [ -n "$LOGOUTPUT" ]; then
+    curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/probes/$fromPROBEUUID |
+      sed 's/error code: 1003//g' | jq 'del(.stages[].anomaly_count, .stages[].dynamic, .stages[].keys, .stages[].type, .stages[].warnings, .stages[].values) |
+      {label: .label, description: .description, tags: .tags, processors: .processors, stages: .stages, id: .id}' |
+      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $LOGOUTPUT/${fromPROBEname}_prob.json
+  else
+    if [ $DEBUG -eq 1 ]; then
+      echo "CURL debug on *******"
+      curl -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/probes/$fromPROBEUUID
+      echo ""
+      echo "CURL debug off *******"
+     fi
+    curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/probes/$fromPROBEUUID |
+      sed 's/error code: 1003//g' | jq 'del(.stages[].anomaly_count, .stages[].dynamic, .stages[].keys, .stages[].type, .stages[].warnings, .stages[].values) |
+      {label: .label, description: .description, tags: .tags, processors: .processors, stages: .stages, id: .id}' |
+      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g'
+  fi
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+build-queries
+get-tokens
+get-BPlist
+get-BPFdetails
+#get-Probes
+get-PROBElist
+get-PROBEdetails
+if [ $fromPROBEUUID == "ALLID" ]; then
+  retrieve-PROBEloop
+else
+  retrieve-PROBE
+fi
+if [ $DEBUG -eq 0 ]; then clear-json; fi

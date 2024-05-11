@@ -1,0 +1,431 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: dumpCustomWidgets
+#  PURPOSE: Used to dispaly the json for probes of type extensible_data_collector
+#
+#  CREATED: 02/12/24
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 02/12/24
+#  BY: Jay A Wilson
+#  VERSION: 1.00
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+JINCLUDE=""
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -in|--include)
+            JINCLUDE="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -o|--output)
+            LOGOUTPUT="$2"
+            shift # past argument
+            shift # past value
+        ;;
+          -h|--help)
+              help-info
+              exit 0
+          ;;
+          -x)
+              DEBUG=1
+              shift
+          ;;
+          -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+              JDEBUG=1
+              DEBUG=1
+              shift
+          ;;
+          *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+              shift # past argument
+          ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # need to know where to dump the configlet(s) too
+  if [ -n "$LOGOUTPUT" ] && [ ! -d "${LOGOUTPUT}/" ]; then
+    echo ""; echo " Output directory does not exist"; echo " ...exit()"
+    exit 1
+  fi
+  # acknowledge which widgets will be included
+  if [ "$JINCLUDE" != "" ]; then
+    JINCLUDE=`echo $JINCLUDE | tr '[:upper:]' '[:lower:]'`
+    echo ""; echo "*** Only Widgets with \"$JINCLUDE\" in its name will be listed."; echo ""
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool prints a listing of all Extensible Data Collector"
+    echo "      probes currently provisioned in a Blueprint."
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Blueprint listing from Juniper Apstra"
+    echo ""
+    echo "  Widget names that contain <spaces> or /s will have"
+    echo "    those characters converted to a - "
+    echo ""
+    echo "  When including Widgets, if the string contains special"
+    echo "    characters, enclose the string in '' "
+    echo ""
+    echo "  syntax: "
+    echo "      dumpCustomWidgets -ai|--Apstraip <Apstra-ip>    *"
+    echo "                        -au|--Apstrauid <Apstra-uid>   *"
+    echo "                        -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "                        -in|--include <string>         ^"
+    echo "                         -o|--output <directory>"
+    echo "                         -h|--help"
+    echo ""
+    echo "               * = required"
+    echo "               ^ = case insensitive"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+}
+#####
+#
+#  Build the graph queries to use
+#
+#####
+build-queries(){
+  # JSON to request Apstra Token
+  cat > /tmp/rzvids <<EOF
+{
+  "query": "node('security_zone', name='vn_instance')"
+}
+EOF
+cat > /tmp/vnvids <<EOF
+{
+  "query": "node('vn_instance', name='vn_instance')"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to get a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the Apstra server
+  BPFlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints |
+           jq '.items[] | .label, .id' | sed 'N;s/\n/,/' | sed -e 's/ /~/g' | sed -e 's/"//g') )
+  BPFlistelements=${#BPFlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $BPFlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPFdetails(){
+  echo " From Blueprints:"
+  for((ij=0;ij<$BPFlistelements;ij++))
+  do
+    BPFname=`echo "${BPFlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    BPFUUID=`echo "${BPFlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPFname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFUUID) $BPFUUID"; fi
+
+    BPFitem=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${BPFUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPFitemelements=${#BPFitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFlistelements) $BPFlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFitemelements) $BPFitemelements"; fi
+    #do-BPdetails
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  fromBPname=`echo "${BPFlist[fromsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  fromBPUUID=`echo "${BPFlist[fromsponse]}" | cut -d',' -f2`
+}
+
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"FROM\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     case $fromsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# called by main() to get a listing of all Widgets
+#
+#####
+get-WIDGETlist(){
+  #create and array of all the Custom WIDGETboards
+  #curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/hwidgets |
+  # jq '.items[] | .label, .id'
+
+  WIDGETarray=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/widgets |
+   jq '.items[] | .label, .id' | sed 's/[ \/]/-/g' | sed 'N;s/\n/,/' | sed -e 's/"//g' |
+   awk -v ex="$JINCLUDE" '{lower = tolower($0); if(index(lower,ex) != 0) print $0}') )
+  # add an "all" entry as entry 0 in the array
+  WIDGETlist=( $(echo "dump-ALL-WIDGETS,ALLID") )
+  WIDGETlist+=("${WIDGETarray[@]}")
+  WIDGETlistelements=${#WIDGETlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-WIDGETlist) K:(WIDGETlistelements) $WIDGETlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each Widget
+#
+#####
+get-WIDGETdetails(){
+  echo "Widget to dump:"; echo ""
+  for((ij=0;ij<$WIDGETlistelements;ij++))
+  do
+    WIDGETname=`echo "${WIDGETlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    WIDGETUUID=`echo "${WIDGETlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$WIDGETname
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-WIDGETfromNumber
+  fromWIDGETUUID=`echo "${WIDGETlist[fromNsponse]}"| cut -d',' -f2`
+  fromWIDGETname=`echo "${WIDGETlist[fromNsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-WIDGETdetails) K:(fromWIDGETUUID) $fromWIDGETUUID"; fi
+
+}
+#####
+#
+# called by get-WIDGETdetails() to determine which Configlet to dump
+#
+#####
+get-WIDGETfromNumber(){
+  loop2=0
+  echo ""
+  echo "Input Widget Number or Q to quit"
+  while [ $loop2 -eq 0 ]
+  do
+     read fromNsponse
+     case $fromNsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromNsponse" -ge "0" ] && [ "$fromNsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       q|Q)
+          exit
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-nodefromNumber) K:(fromNsponse) $fromNsponse"; fi
+  done
+}
+#####
+#
+# called by main() to loop through dumpping all Configlets
+#
+#####
+dump-WIDGETloop(){
+  echo " Dumping Custom Widgets:"
+  for((ij=1;ij<$WIDGETlistelements;ij++))
+  do
+    fromWIDGETname=`echo "${WIDGETlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    fromWIDGETUUID=`echo "${WIDGETlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$fromWIDGETname
+    dump-WIDGET
+  done
+}
+#####
+#
+# called by main() and by dump-WIDGETloop to dump a single Widget
+#
+#####
+#
+# zscaler sometimes cause an "error code: 1003" to be generated, so strip it out
+#
+dump-WIDGET(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(dump-WIDGET) K:(WIDGETUUID) $fromWIDGETUUID"; fi
+  if [ -n "$LOGOUTPUT" ]; then
+    curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/widgets/$fromWIDGETUUID |
+      sed 's/error code: 1003//g' | jq 'del(.created_at, .updated_at, .updated_by, .referencing_dashboards, .id)' |
+      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $LOGOUTPUT/${fromWIDGETname}_widg.json
+  else
+    if [ $DEBUG -eq 1 ]; then
+      echo "CURL debug on *******"
+      curl -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/widgets/$fromWIDGETUUID
+      echo ""
+      echo "CURL debug off *******"
+     fi
+    curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/widgets/$fromWIDGETUUID |
+      sed 's/error code: 1003//g' | jq 'del(.created_at, .updated_at, .updated_by, .referencing_dashboards, .id)' |
+      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g'
+  fi
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+build-queries
+get-tokens
+get-BPlist
+get-BPFdetails
+#get-Widgets
+get-WIDGETlist
+get-WIDGETdetails
+if [ $fromWIDGETUUID == "ALLID" ]; then
+  dump-WIDGETloop
+else
+  dump-WIDGET
+fi
+if [ $DEBUG -eq 0 ]; then clear-json; fi

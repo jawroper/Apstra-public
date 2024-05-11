@@ -1,0 +1,461 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: postDPSCCW
+#  PURPOSE: Used to load Collectors, Configlets, Dashboards, Probes,
+#           Service Registries, and Widgets into an Apstra server
+#
+#  CREATED: 05/09/24
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 05/10/24
+#  BY: Jay A Wilson
+#  VERSION: 1.01
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#      v1.01 = changed output-note2()
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+SKIP=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -f|--file)
+            INFILE="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -s|--skip)
+            SKIP=1
+            shift
+        ;;
+        -h|--help)
+            help-info
+            exit 0
+        ;;
+        -x)
+            DEBUG=1
+            shift
+        ;;
+        -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+            JDEBUG=1
+            DEBUG=1
+            shift
+        ;;
+        *)    # unknown option
+            POSITIONAL+=("$1") # save it in an array for later
+            shift # past argument
+        ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # input file is always required
+  if [ -z "$INFILE" ]; then
+    echo ""; echo " You are missing the -f parm"; echo " ...exit()"
+    exit 1
+  fi
+  # need to know where to dump the configlet(s) too
+  if ! [ -f "${INFILE}" ]; then
+    echo ""; echo " Input file does not exist"; echo " ...exit()"
+    exit 1
+  else
+    filename=`echo ${INFILE} | sed 's/.*\///'`
+  fi
+  # acknowledge which configlets will be excluded
+  if [ "$JINCLUDE" != "" ]; then
+    echo ""; echo "*** Any Widgets with \"$JEXCLUDE\" in its name will be Widgets listing."; echo ""
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool posts a Collector, Configlet, Dashboard, Probe,"
+    echo "      Service Registry, or Widget to an Apstra server."
+    echo ""
+    echo "  syntax: "
+    echo "      postDPSCCW -ai|--Apstraip <Apstra-ip>     *"
+    echo "                 -au|--Apstrauid <Apstra-uid>   *"
+    echo "                 -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "                  -f|--file <filename>          *"
+    echo "                  -s|--skip                     ~"
+    echo "                  -h|--help"
+    echo ""
+    echo "               * = required"
+    echo "               ~ = skips producing warning messages to the screen"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+}
+#####
+#
+#  Build the graph queries to use
+#
+#####
+build-queries(){
+  # JSON to request Apstra Token
+  cat > /tmp/rzvids <<EOF
+{
+  "query": "node('security_zone', name='vn_instance')"
+}
+EOF
+cat > /tmp/vnvids <<EOF
+{
+  "query": "node('vn_instance', name='vn_instance')"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to get a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the Apstra server
+  BPFlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints |
+           jq '.items[] | .label, .id' | sed 'N;s/\n/,/' | sed -e 's/ /~/g' | sed -e 's/"//g') )
+  BPFlistelements=${#BPFlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $BPFlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPFdetails(){
+  echo " From Blueprints:"
+  for((ij=0;ij<$BPFlistelements;ij++))
+  do
+    BPFname=`echo "${BPFlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    BPFUUID=`echo "${BPFlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPFname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFUUID) $BPFUUID"; fi
+
+    BPFitem=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${BPFUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPFitemelements=${#BPFitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFlistelements) $BPFlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFitemelements) $BPFitemelements"; fi
+    #do-BPdetails
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  fromBPname=`echo "${BPFlist[fromsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  fromBPUUID=`echo "${BPFlist[fromsponse]}" | cut -d',' -f2`
+}
+
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"FROM\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     case $fromsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# call by main() to determine what type of file needs to be processed
+#
+#####
+do-case(){
+  case "$filename" in
+    *"_widg.json"*)
+      echo "Processing Widget"
+      if [ $SKIP -eq 0 ]; then output-note "Widgets" "Probes"; fi
+      if [ $SKIP -eq 0 ]; then output-note2 "Widgets"; fi
+      get-BPlist
+      get-BPFdetails
+      do-widget
+    ;;
+    *"_coll.json"*)
+      echo "Processing Collector"
+      do-collector
+      if [ $SKIP -eq 0 ]; then output-note "Collectors" "Service Registries"; fi
+    ;;
+    *"_dash.json"*)
+      echo "Processing Dashboard"
+      if [ $SKIP -eq 0 ]; then output-note "Dashboards" "Widgets"; fi
+      if [ $SKIP -eq 0 ]; then output-note2 "Dashboards"; fi
+      get-BPlist
+      get-BPFdetails
+      do-dashboard
+    ;;
+    *"_prob.json"*)
+      echo "Processing Probe"
+      get-BPlist
+      get-BPFdetails
+      do-probe
+    ;;
+    *"_serv.json"*)
+      echo "Processing Service Registery"
+      do-service
+    ;;
+    *"_cflt.json"*)
+      echo "Processing Configlet"
+      do-configlet
+    ;;
+    *)
+      echo "File is not of a recognized type."
+      echo " ...exit()"
+    ;;
+  esac
+}
+#####
+#
+# called by do-case() to Post the Collector
+#
+#####
+do-collector(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-collector) K:(INFILE) $INFILE"; fi
+  curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/telemetry/collectors --data-binary "@$INFILE"
+  echo ""
+}
+#####
+#
+# called by do-case() to Post a Service Registry
+#
+#####
+do-service(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-service) K:(INFILE) $INFILE"; fi
+  curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/telemetry-service-registry --data-binary "@$INFILE"
+  echo ""
+}
+#####
+#
+# called by do-case() to Post a Configlet
+#
+#####
+do-configlet(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-configlet) K:(INFILE) $INFILE"; fi
+  curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/design/configlets --data-binary "@$INFILE"
+  echo ""
+}
+#####
+#
+# called by do-case() to Post a Probe
+#
+#####
+do-probe(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-probe) K:(INFILE) $INFILE"; fi
+  curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/$fromBPUUID/probes --data-binary "@$INFILE"
+  echo ""
+}
+#####
+#
+# called by do-case() to Post a Widget
+#
+#####
+do-widget(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-widget) K:(INFILE) $INFILE"; fi
+  curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/$fromBPUUID/iba/widgets --data-binary "@$INFILE"
+  echo ""
+}
+#####
+#
+# called by do-case() to Post a Dashboard
+#
+#####
+do-dashboard(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-dashboard) K:(INFILE) $INFILE"; fi
+  curl -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X POST https://$ApstraIP/api/blueprints/$fromBPUUID/iba/dashboards --data-binary "@$INFILE"
+  echo ""
+}
+#####
+#
+# routines used to write a NOTE to the screen
+#
+#####
+output-note2(){
+  local inputstr=$1
+  sing=`echo $inputstr | sed 's/.$//'`
+  echo ""
+  echo "NOTE: *****"
+  echo "   $inputstr are Blueprint specific!"
+  echo "   You will be prompted to select which Blueprint to add the $sing to."
+  echo ""
+  echo "press <Enter>"
+  read jnull
+}
+#####
+#
+# routines used to write a NOTE to the screen about prerequirests
+#
+#####
+output-note(){
+  local input1=$1
+  local input2=$2
+  loop2=0
+  echo ""
+  echo "NOTE: *****"
+  echo "   $1 require that $2 used by it already exist"
+  echo ""
+  echo "Enter Q to quit or any other key to continue"
+  while [ $loop2 -eq 0 ]
+  do
+     read Notesponse
+     case $Notesponse in
+       q|Q)
+          exit
+          ;;
+       *)
+          loop2=1
+          ;;
+     esac
+  done
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+build-queries
+get-tokens
+do-case
+if [ $DEBUG -eq 0 ]; then clear-json; fi

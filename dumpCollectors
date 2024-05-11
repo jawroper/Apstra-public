@@ -1,0 +1,347 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: retrieveCustomCollectors
+#  PURPOSE: Used to list/show/save the Custom Collectors Registry that exist on an
+#           Apstra Server
+#
+#  CREATED: 05/02/24
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 05/09/24
+#  BY: Jay A Wilson
+#  VERSION: 1.03
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#      v1.01 = add _coll suffix to the output file
+#      v1.02 = zscaler sometimes cause an "error code: 1003" to be generated,
+#              so strip it out
+#      v1.03 = made "-ex" case insensitive
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+# change EXPATTERN if there is a Collector labeled Z9A0Z9A0
+EXPATTERN="z9a0z9a0"
+CEXCLUDE=$EXPATTERN
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -h|--help)
+            help-info
+            exit 0
+        ;;
+        -o|--output)
+            LOGOUTPUT="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -ex|--exclude)
+            CEXCLUDE="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -x)
+            DEBUG=1
+            shift
+        ;;
+        -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+            JDEBUG=1
+            DEBUG=1
+            shift
+        ;;
+        *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+            shift # past argument
+        ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # need to know where to retrieve the configlet(s) too
+  if [ -n "$LOGOUTPUT" ] && [ ! -d "${LOGOUTPUT}/" ]; then
+    echo ""; echo " Output directory does not exist"; echo " ...exit()"
+    exit 1
+  fi
+  # acknowledge which configlets will be excluded
+  if [ "$CEXCLUDE" != "$EXPATTERN" ]; then
+    CEXCLUDE=`echo $CEXCLUDE | tr '[:upper:]' '[:lower:]'`
+    echo ""; echo "*** Any Collector with \"$CEXCLUDE\" in its name will be excluded from the Collector listing."; echo ""
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool prints a listing of custom Collectors"
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Collector(s) from Juniper Apstra"
+    echo "      List/Show/Save the Collector(s)"
+    echo ""
+    echo "  Collector(s) output will be sent to the screen unless"
+    echo "    option -o is specified"
+    echo ""
+    echo "  Collector names that contain <spaces> or /s will have"
+    echo "    those characters converted to a - "
+    echo ""
+    echo "  When excluding Collectors, if the string contains special"
+    echo "    characters, enclose the string in '' "
+    echo ""
+    echo "  syntax: "
+    echo "      retrieveCustomCollectors -ai|--Apstraip <Apstra-ip>     *"
+    echo "                               -au|--Apstrauid <Apstra-uid>   *"
+    echo "                               -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "                               -ex|--exclude <string>         ^"
+    echo "                                -o|--output <directory>"
+    echo "                                -h|--help"
+    echo ""
+    echo "               * = required"
+    echo "               ^ = case insensitive"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromToken) $Apstratoken"; fi
+}
+#####
+#
+# called by main() to get a listing of all Collectors
+#
+#####
+get-COLLECTlist(){
+  #create and array of all the Custom Collectors
+  #curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/telemetry/collectors | jq '.items | keys[]' | sort --ignore-case
+  COLLECTarray=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/telemetry/collectors |
+   jq '.items | keys[]' | sort --ignore-case | sed 's/[ \/]/-/g' | sed -e 's/"//g' |
+   awk -v ex="$CEXCLUDE" '{lower = tolower($0); if(index(lower,ex) == 0) print $0}') )
+  # add an "all" entry as entry 0 in the array
+  COLLECTlist=( $(echo "retrieve-ALL-Collectors") )
+  COLLECTlist+=("${COLLECTarray[@]}")
+  COLLECTlistelements=${#COLLECTlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-COLLECTlist) K:(COLLECTlistelements) $COLLECTlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each Collector
+#
+#####
+get-COLLECTdetails(){
+  echo "Collector to retrieve:"; echo ""
+  for((ij=0;ij<$COLLECTlistelements;ij++))
+  do
+    COLLECTname=`echo "${COLLECTlist[ij]}" | sed -e 's/ /~/g'`
+    echo $ij" "$COLLECTname
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-COLLECTfromNumber
+  fromCOLLECTname=`echo "${COLLECTlist[fromNsponse]}" | sed -e 's/~/ /g'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-COLLECTdetails) K:(fromCOLLECTname) $fromCOLLECTname"; fi
+
+}
+#####
+#
+# called by get-COLLECTdetails() to determine which Collector to retrieve
+#
+#####
+get-COLLECTfromNumber(){
+  loop2=0
+  echo ""
+  echo "Input Collector Number or Q to quit"
+  while [ $loop2 -eq 0 ]
+  do
+     read fromNsponse
+     case $fromNsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromNsponse" -ge "0" ] && [ "$fromNsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       q|Q)
+          exit
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-nodefromNumber) K:(fromNsponse) $fromNsponse"; fi
+  done
+}
+#####
+#
+# called by main() to loop through retrieveping all Collectors
+#
+#####
+retrieve-COLLECTloop(){
+  echo " Retrieving all Collectors:"
+  for((ij=1;ij<$COLLECTlistelements;ij++))
+  do
+    fromCOLLECTname=`echo "${COLLECTlist[ij]}" | sed -e 's/ /~/g'`
+    echo $ij" "$fromCOLLECTname
+    retrieve-COLLECT
+  done
+}
+#####
+#
+# called by main() and by retrieve-COLLECTloop to retrieve a single Collector
+#
+#####
+#
+# zscaler sometimes cause an "error code: 1003" to be generated, so strip it out
+#
+retrieve-COLLECT(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(retrieve-COLLECT) K:(COLLECTname) $fromCOLLECTname"; echo ""; echo ""; fi
+  if [ -n "$LOGOUTPUT" ]; then
+    curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/telemetry/collectors/$fromCOLLECTname |
+      sed 's/error code: 1003//g' | sed 's/"items": \[/"service_name": "'"$fromCOLLECTname"'",\n      "collectors": \[/' | jq '.' > $LOGOUTPUT/${fromCOLLECTname}_coll.json
+  else
+    if [ $DEBUG -eq 1 ]; then
+      echo "CURL debug on *******"
+      curl -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/telemetry/collectors/$fromCOLLECTname
+      echo ""
+      echo "CURL debug off *******"
+     fi
+    curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/telemetry/collectors/$fromCOLLECTname |
+      sed 's/error code: 1003//g' | sed 's/"items": \[/"service_name": "'"$fromCOLLECTname"'",\n      "collectors": \[/' | jq '.'
+    #  jq '.. | select(.template_text?)' | jq '.template_text' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g'
+  fi
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+get-tokens
+get-COLLECTlist
+get-COLLECTdetails
+if [ $fromCOLLECTname == "retrieve-ALL-Collectors" ]; then
+  retrieve-COLLECTloop
+else
+  retrieve-COLLECT
+fi
+if [ $DEBUG -eq 0 ]; then clear-json; fi

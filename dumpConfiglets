@@ -1,0 +1,372 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: retrieveConfiglets
+#  PURPOSE: Used to list/show/save the Configlets that exist on an Apstra Server
+#
+#  CREATED: 03/28/24
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 05/09/24
+#  BY: Jay A Wilson
+#  VERSION: 1.21
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#      v1.01 = added the -o option and logic
+#      v1.10 = added the -e option and logic
+#              removed the hard check for "prox-arp"
+#      v1.11 = made -e option more flexible by adding EXPATTERN logic
+#      v1.12 = added logic to graceully exit the script instead of having
+#                to select a Configlet number
+#      v1.13 = add _conflet suffix to the output file
+#      v1.20 = added all the logic for checking if the output will be used
+#              as input to an Apstra API call
+#      v1.21 = made "-ex" case insensitive
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+JAPI=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+# change EXPATTERN if there is a Configlet labeled Z9A0Z9A0
+EXPATTERN="z9a0z9a0"
+CEXCLUDE=$EXPATTERN
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -h|--help)
+            help-info
+            exit 0
+        ;;
+        -o|--output)
+            LOGOUTPUT="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -ex|--exclude)
+            CEXCLUDE="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -p|--api)
+            JAPI=1
+            shift
+        ;;
+        -x)
+            DEBUG=1
+            shift
+        ;;
+        -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+            JDEBUG=1
+            DEBUG=1
+            shift
+        ;;
+
+        *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+            shift # past argument
+        ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # need to know where to retrieve the configlet(s) too
+  if [ -n "$LOGOUTPUT" ] && [ ! -d "${LOGOUTPUT}/" ]; then
+    echo ""; echo " Output directory does not exist"; echo " ...exit()"
+    exit 1
+  fi
+  # acknowledge which configlets will be excluded
+  if [ "$CEXCLUDE" != "$EXPATTERN" ]; then
+    CEXCLUDE=`echo $CEXCLUDE | tr '[:upper:]' '[:lower:]'`
+    echo ""; echo "*** Any Configlet with \"$CEXCLUDE\" in its name will be excluded from the Configlet listing."; echo ""
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool prints a listing of all Configlets"
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Configlet(s) from Juniper Apstra"
+    echo "      List/Show/Save the Configlet(s)"
+    echo ""
+    echo "  Configlet(s) output will be sent to the screen unless"
+    echo "    option -o is specified"
+    echo ""
+    echo "  Configlet names that contain <spaces> or /s will have"
+    echo "    those characters converted to a - "
+    echo ""
+    echo "  When excluding Configlets, if the string contains special"
+    echo "    characters, enclose the string in '' "
+    echo ""
+    echo "  syntax: "
+    echo "      retrieveConfiglets -ai|--Apstraip <Apstra-ip>     *"
+    echo "                         -au|--Apstrauid <Apstra-uid>   *"
+    echo "                         -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "                         -ex|--exclude <string>         ^"
+    echo "                          -o|--output <directory>"
+    echo "                          -p|--api"
+    echo "                          -h|--help"
+    echo ""
+    echo "               * = required"
+    echo "               ^ = case insensitive"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromToken) $Apstratoken"; fi
+}
+#####
+#
+# called by main() to get a listing of all Configlets
+#
+#####
+get-CFGlist(){
+  #create and array of all the configlets
+  #
+  CFGarray=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/design/configlets |
+           jq -c '.items[] | .display_name, .id' | sed 's/[ \/]/-/g' | sed 'N;s/\n/,/' | sed -e 's/"//g' |
+           awk -v ex="$CEXCLUDE" '{lower = tolower($0); if(index(lower,ex) == 0) print $0}') )
+  # add an "all" entry as entry 0 in the array
+  CFGlist=( $(echo "retrieve-ALL-configlets,ALLID") )
+  CFGlist+=("${CFGarray[@]}")
+  CFGlistelements=${#CFGlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-CFGlist) K:(CFGlistelements) $CFGlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each Configlet
+#
+#####
+get-CFGdetails(){
+  echo "CONFIGLET to retrieve:"; echo ""
+  for((ij=0;ij<$CFGlistelements;ij++))
+  do
+    CFGname=`echo "${CFGlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    CFGUUID=`echo "${CFGlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$CFGname
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-CFGfromNumber
+  fromCFGUUID=`echo "${CFGlist[fromNsponse]}"| cut -d',' -f2`
+  fromCFGname=`echo "${CFGlist[fromNsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-CFGdetails) K:(fromCFGUUID) $fromCFGUUID"; fi
+
+}
+#####
+#
+# called by get-CFGdetails() to determine which Configlet to retrieve
+#
+#####
+get-CFGfromNumber(){
+  loop2=0
+  echo ""
+  echo "Input Configlet Number or Q to quit"
+  while [ $loop2 -eq 0 ]
+  do
+     read fromNsponse
+     case $fromNsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromNsponse" -ge "0" ] && [ "$fromNsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       q|Q)
+          exit
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-nodefromNumber) K:(fromNsponse) $fromNsponse"; fi
+  done
+}
+#####
+#
+# called by main() to loop through retrieveping all Configlets
+#
+#####
+retrieve-CFGloop(){
+  echo " Retrieving all Configlets:"
+  for((ij=1;ij<$CFGlistelements;ij++))
+  do
+    fromCFGname=`echo "${CFGlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    fromCFGUUID=`echo "${CFGlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$fromCFGname
+    retrieve-CFG
+  done
+}
+#####
+#
+# called by main() and by retrieve-CFGloop to retrieve a single Configlet
+#
+#####
+retrieve-CFG(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(retrieve-CFG) K:(CFGUUID) $fromCFGUUID"; fi
+  #
+  # if the retrieveped Configlet will be used as input into an Apstra API call
+  #    the format needs to be different and contain additional fields
+  #
+  if [ -n "$LOGOUTPUT" ]; then
+    if [ $JAPI -eq 1 ]; then
+      curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/design/configlets/$fromCFGUUID |
+        sed 's/error code: 1003//g' | jq '. | del(.created_at, .last_modified_at)'  > $LOGOUTPUT/${fromCFGname}_cflt.json
+    else
+      curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/design/configlets/$fromCFGUUID |
+        sed 's/error code: 1003//g' | jq '.. | select(.template_text?)' | jq '.template_text' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $LOGOUTPUT/${fromCFGname}_cflt.json
+    fi
+  else
+    if [ $DEBUG -eq 1 ]; then
+      echo "CURL debug on *******"
+      curl -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/design/configlets/$fromCFGUUID
+      echo ""
+      echo "CURL debug off *******"
+    fi
+    if [ $JAPI -eq 1 ]; then
+      curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/design/configlets/$fromCFGUUID |
+        sed 's/error code: 1003//g' | jq '. | del(.created_at, .last_modified_at)'
+    else
+      curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/design/configlets/$fromCFGUUID |
+        sed 's/error code: 1003//g' | jq '.. | select(.template_text?)' | jq '.template_text' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g'
+    fi
+  fi
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+get-tokens
+get-CFGlist
+get-CFGdetails
+if [ $fromCFGUUID == "ALLID" ]; then
+  retrieve-CFGloop
+else
+  retrieve-CFG
+fi
+if [ $DEBUG -eq 0 ]; then clear-json; fi
