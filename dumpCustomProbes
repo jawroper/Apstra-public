@@ -8,12 +8,14 @@
 #  CREATED: 02/12/24
 #  BY: Jay A Wilson
 #
-#  LAST MOD: 02/12/24
+#  LAST MOD: 05/22/24
 #  BY: Jay A Wilson
-#  VERSION: 1.00
+#  VERSION: 1.10
 #
 #  MODIFICATION HISTORY:
 #      v1.00 = Initial Release
+#      v1.10 = removed graph queries
+#              added BPname to output files for Probes, Widgets, and Dashboards
 #
 #
 #
@@ -173,24 +175,6 @@ build-tokens(){
 {
   "username":"${ApstraUID}",
   "password": "${ApstraPWD}"
-}
-EOF
-}
-#####
-#
-#  Build the graph queries to use
-#
-#####
-build-queries(){
-  # JSON to request Apstra Token
-  cat > /tmp/rzvids <<EOF
-{
-  "query": "node('security_zone', name='vn_instance')"
-}
-EOF
-cat > /tmp/vnvids <<EOF
-{
-  "query": "node('vn_instance', name='vn_instance')"
 }
 EOF
 }
@@ -386,10 +370,11 @@ retrieve-PROBEloop(){
 retrieve-PROBE(){
   if [ $DEBUG -eq 1 ]; then output-debug "R:(retrieve-PROBE) K:(PROBEUUID) $fromPROBEUUID"; fi
   if [ -n "$LOGOUTPUT" ]; then
+    outfile=`echo "$LOGOUTPUT/${fromPROBEname}_${fromBPname}_prob.json" | sed 's/ /-/g'`
     curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/probes/$fromPROBEUUID |
       sed 's/error code: 1003//g' | jq 'del(.stages[].anomaly_count, .stages[].dynamic, .stages[].keys, .stages[].type, .stages[].warnings, .stages[].values) |
       {label: .label, description: .description, tags: .tags, processors: .processors, stages: .stages, id: .id}' |
-      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $LOGOUTPUT/${fromPROBEname}_prob.json
+      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $outfile
   else
     if [ $DEBUG -eq 1 ]; then
       echo "CURL debug on *******"
@@ -421,7 +406,6 @@ output-debug(){
 do-args
 clear-json
 build-tokens
-build-queries
 get-tokens
 get-BPlist
 get-BPFdetails

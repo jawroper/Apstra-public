@@ -8,12 +8,14 @@
 #  CREATED: 02/12/24
 #  BY: Jay A Wilson
 #
-#  LAST MOD: 02/12/24
+#  LAST MOD: 05/22/24
 #  BY: Jay A Wilson
-#  VERSION: 1.00
+#  VERSION: 1.10
 #
 #  MODIFICATION HISTORY:
 #      v1.00 = Initial Release
+#      v1.10 = removed graph queries
+#              added BPname to output files for Probes, Widgets, and Dashboards
 #
 #
 #
@@ -194,24 +196,6 @@ EOF
 }
 #####
 #
-#  Build the graph queries to use
-#
-#####
-build-queries(){
-  # JSON to request Apstra Token
-  cat > /tmp/rzvids <<EOF
-{
-  "query": "node('security_zone', name='vn_instance')"
-}
-EOF
-cat > /tmp/vnvids <<EOF
-{
-  "query": "node('vn_instance', name='vn_instance')"
-}
-EOF
-}
-#####
-#
 #  called my main() to get tokens for Apstra
 #
 #####
@@ -383,9 +367,10 @@ dump-WIDGETloop(){
 dump-WIDGET(){
   if [ $DEBUG -eq 1 ]; then output-debug "R:(dump-WIDGET) K:(WIDGETUUID) $fromWIDGETUUID"; fi
   if [ -n "$LOGOUTPUT" ]; then
+    outfile=`echo "$LOGOUTPUT/${fromWIDGETname}_${fromBPname}_widg.json" | sed 's/ /-/g'`
     curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/widgets/$fromWIDGETUUID |
       sed 's/error code: 1003//g' | jq 'del(.created_at, .updated_at, .updated_by, .referencing_dashboards, .id)' |
-      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $LOGOUTPUT/${fromWIDGETname}_widg.json
+      sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $outfile
   else
     if [ $DEBUG -eq 1 ]; then
       echo "CURL debug on *******"
@@ -416,7 +401,6 @@ output-debug(){
 do-args
 clear-json
 build-tokens
-build-queries
 get-tokens
 get-BPlist
 get-BPFdetails

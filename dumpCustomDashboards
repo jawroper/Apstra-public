@@ -9,9 +9,9 @@
 #  CREATED: 05/02/24
 #  BY: Jay A Wilson
 #
-#  LAST MOD: 05/09/24
+#  LAST MOD: 05/22/24
 #  BY: Jay A Wilson
-#  VERSION: 1.03
+#  VERSION: 1.10
 #
 #  MODIFICATION HISTORY:
 #      v1.00 = Initial Release
@@ -19,6 +19,7 @@
 #      v1.02 = zscaler sometimes cause an "error code: 1003" to be generated,
 #              so strip it out
 #      v1.03 = made "-ex" case insensitive
+#      v1.10 = added BPname to output files for Probes, Widgets, and Dashboards
 #
 #
 #
@@ -373,8 +374,9 @@ retrieve-DASHloop(){
 retrieve-DASH(){
   if [ $DEBUG -eq 1 ]; then output-debug "R:(retrieve-DASH) K:(DASHUUID) $fromDASHUUID"; fi
   if [ -n "$LOGOUTPUT" ]; then
+    outfile=`echo "$LOGOUTPUT/${fromDASHname}_${fromBPname}_dash.json" | sed 's/ /-/g'`
     curl -s -k -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" GET https://$ApstraIP/api/blueprints/$fromBPUUID/iba/dashboards/$fromDASHUUID |
-       sed 's/error code: 1003//g' | jq 'del(.created_at, .updated_at, .updated_by, .predefined_dashboard, .id)' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $LOGOUTPUT/${fromDASHname}_dash.json
+       sed 's/error code: 1003//g' | jq 'del(.created_at, .updated_at, .updated_by, .predefined_dashboard, .id)' | sed 's/^"\(.*\)"$/\1/' | sed 's/\\n/\n/g' > $outfile
   else
     if [ $DEBUG -eq 1 ]; then
       echo "CURL debug on *******"
