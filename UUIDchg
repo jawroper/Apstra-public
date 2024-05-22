@@ -1,0 +1,278 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: UUIDchg
+#  PURPOSE: Used to change the UUID on Probes and all associated Widgets from
+#           an Apstra server
+#
+#  CREATED: 05/22/24
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 05/22/24
+#  BY: Jay A Wilson
+#  VERSION: 1.00
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+LASTARGCHECK=0
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -d|--directory)
+            JDIRECTORY="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -p|--prefix)
+            JPREFIX="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -h|--help)
+            help-info
+            exit 0
+        ;;
+        -x)
+            DEBUG=1
+            shift
+        ;;
+        -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+            JDEBUG=1
+            DEBUG=1
+            shift
+        ;;
+        *)    # unknown option
+            POSITIONAL+=("$1") # save it in an array for later
+            shift # past argument
+        ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  if [ -z "$JDIRECTORY" ]; then
+    echo ""; echo " Parm -d must be specified."; echo " ...exit()"
+    exit 1
+  else
+    # if the directory name input does not end in a /, add it
+    JDIRECTORY=$(echo "$JDIRECTORY" | sed 's|[^/]$|&/|')
+  fi
+  # need to know where to retrieve the input from
+  if [ -n "$JDIRECTORY" ] && [ ! -d "${JDIRECTORY}" ]; then
+    echo ""; echo " Input directory does not exist"; echo " ...exit()"
+    exit 1
+  fi
+  if [ -z "$JPREFIX" ]; then
+    echo ""; echo " Parm -p must be specified."; echo " ...exit()"
+    exit 1
+  fi
+  valid-prefix
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool changes the UUID for each Probe file found in the"
+    echo "    specified directory.  It will also update any Widget file(s)"
+    echo "    found in the directory to point to the changed UUID(s)."
+    echo "    The original files will not be changed. All changes will"
+    echo "    happen to newly created files."
+    echo ""
+    echo "  syntax: "
+    echo "      UUIDchg -d|--directory <directory> *"
+    echo "              -p|--prefix <string>       *"
+    echo "              -h|--help"
+    echo ""
+    echo "               * = required"
+    echo ""
+    echo "  Option Details:"
+    echo ""
+    echo " -d  directory to search for Probe files"
+    echo " -p  prefix to append for creating new files"
+    echo ""
+    echo "(PAUSED) - press <Enter>"
+    read jnull
+    echo ""
+    echo " *** WHY THIS TOOL EXIST ***"
+    echo ""
+    echo "     Dashboards, Widgets, and Probes are Blueprint specific. They"
+    echo "     all require UUIDs inside an Apstra Server for each instancation"
+    echo "     of them."
+    echo "            Example: In Blueprint PHX-DC01 I create a Probe called"
+    echo "                     ECN-check.  Now I create another Blueprint called"
+    echo "                     PHX-DC02 and I want to use the same Probe ECN-check."
+    echo "                     The Probes have the same name. The Probes functions"
+    echo "                     are identical. However, since they are in different"
+    echo "                     Blueprints the graphDB needs to store them as "
+    echo "                     different objects. To do that each needs its own"
+    echo "                     UUID."
+    echo ""
+    echo "(PAUSED) - press <Enter>"
+    read jnull
+    echo ""
+    echo "     This tool will take a Probe, create an identical probe, change the UUID"
+    echo "     of the newly created probe and if widgets exist that reference the"
+    echo "     probe, then create new widgets that reference the new probe UUID."
+    echo "     You can repeat this process multiple times for the same probe."
+    echo ""
+    echo "            Example: I have a Probe called ECN-check and there are 2 Widgets"
+    echo "                     that reference it. I went to turn up 3 new fabrics"
+    echo "                     and have all of them use ECN-check and the Widgets."
+    echo "                     With this tool, you can run it 3 times. Each time change"
+    echo "                     -p option to a unqiue string. In this example my 3 new"
+    echo "                     fabrics will be called fab2, fab3, and fab4.  I would:"
+    echo "                            UUIDchg -d ~/Desktop/fab1 -p fab2"
+    echo "                            UUIDchg -d ~/Desktop/fab1 -p fab3"
+    echo "                            UUIDchg -d ~/Desktop/fab1 -p fab4"
+    echo ""
+}
+#####
+#
+#  Called my do_args() to varify if the prefix syntax is valid for a filename
+#
+#####
+valid-prefix(){
+  rx='([a-zA-Z][a-zA-Z0-9])'
+  if [[ $JPREFIX =~ ^[a-zA-Z][a-zA-Z0-9]*$ ]]; then
+    JPREFIX=$JPREFIX
+  else
+    echo " Prefix format is not valid. Must be an alpha followed by upto 15 alpha-numerics"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+# called by main() to get a listing of all Probe files in the directory
+#
+#####
+get-Plist(){
+  #create and array of all the Blueprints defined in the Apstra server
+  cd $JDIRECTORY
+  Plist=( $(grep \"id\": *_prob.json 2> /dev/null | awk '{printf("%s,%s\n",substr($1,0,length($1)-11),$NF)}' | sed 's/\"//g') )
+  Plistelements=${#Plist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $Plistelements"; fi
+}
+#####
+#
+# called by main() to process all found Probe files
+#
+#####
+do-PandW(){
+  for((ij=0;ij<$Plistelements;ij++))
+  do
+    PNAME=`echo "${Plist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    PUUID=`echo "${Plist[ij]}" | cut -d',' -f2`
+    echo " Processing $PNAME"
+    echo "    original UUID => $PUUID"
+    NUUID=( $(uuidgen) )
+    echo "    new UUID     => $NUUID"
+    JPfrom=`echo ${JDIRECTORY}${PNAME}_prob.json`
+    JPto=`echo ${JDIRECTORY}${JPREFIX}_${PNAME}_prob.json`
+    cp $JPfrom $JPto
+    sed -i '' -e "s|${PUUID}|${NUUID}|g" $JPto
+    echo "    ${JPto} has been created using the new UUID"
+    get-widget
+    echo ""
+  done
+}
+#####
+#
+# called by do-PandW() to find all Widget files that are using the original UUID
+#        and process them
+#
+#####
+get-widget(){
+  cd $JDIRECTORY
+  Wlist=( $(grep $PUUID *_widg.json | awk '{print $1}' | sed 's/://g') )
+  Wlistelements=${#Wlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-widget) K:(PUUID) $PUUID"; fi
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-widget) K:(Wlistelements) $Wlistelements"; fi
+  case $Wlistelements in
+    0) echo "    No Widgets found using the original UUID"
+       ;;
+    1) echo "    One Widget found using the original UUID. Creating updated Widget"
+       do-widget 0
+       ;;
+    *) echo "    More than one Widget found using the original UUID. Creating multiple updated Widgets"
+       loop-widget
+       ;;
+  esac
+}
+#####
+#
+# called by get-widget() to process all found matching Widgets
+#
+#####
+loop-widget(){
+for((sv=0;sv<$Wlistelements;sv++))
+do
+   do-widget $sv
+done
+}
+#####
+#
+# called by get-widget() and loop-widget to create a Widget file that uses the
+#        new UUID
+#
+#####
+do-widget(){
+    jindex=$1
+    cd $JDIRECTORY
+    JWfrom=`echo ${Wlist[$jindex]}`
+    JWto=`echo ${JPREFIX}_${JWfrom}`
+    #echo "    Widget ${JWfrom} found"
+    cp $JWfrom $JWto
+    sed -i '' -e "s|${PUUID}|${NUUID}|g" ${JWto}
+    echo "    ${JWto} has been created using the new UUID"
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+# main()
+#
+#####
+do-args
+get-Plist
+if [ $Plistelements -ge 1 ]; then
+  do-PandW
+else
+  echo ""
+  echo "  No Probe files found in the directory specified."
+fi
