@@ -23,3 +23,6 @@ sent to an output file(s) the filename will end with one of the following:
 
       Note:  Since Dashboards, Probes, and Widgets are Blueprint specific,
              the output filename will also contain the Blueprint name.
+
+
+UUIDchg - for a complete explanation read its built in help "UUIDchg -h"
