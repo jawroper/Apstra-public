@@ -303,8 +303,8 @@ do-case(){
     ;;
     *"_coll.json"*)
       echo "Processing Collector"
-      do-collector
       if [ $SKIP -eq 0 ]; then output-note "Collectors" "Service Registries"; fi
+      do-collector
     ;;
     *"_dash.json"*)
       echo "Processing Dashboard"
