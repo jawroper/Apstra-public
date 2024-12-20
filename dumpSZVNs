@@ -1,0 +1,520 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: dumpSZVNs
+#  PURPOSE: Used to display which SZs and VNs are currently being used by a blueprint.
+#
+#  CREATED: 10/07/23
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 12/19/25
+#  BY: Jay A Wilson
+#  VERSION: 2.11
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#       2.00 = Added supported for CSV output
+#       2.01 = minor clean of messages
+#              fixed an output issue with the "default" SZ. VNI and VID needed
+#                 to be swapped
+#       2.02 = simplify do-output and do-CSVoutput
+#       2.10 = added support for non-reserved VLAN_IDs for vn_type of VXLANid
+#                 mods required to get-VNlist, do-output and do-CSVoutput
+#       2.11 = simplified the awk used by do-output and doCSVoutput by changing
+#                 from inline to calling a program file
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+CSV=0
+DUMP=0
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--Apstraip)
+            initApstraIP="$2"
+            if [ "$initApstraIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--Apstrauid)
+            ApstraUID="$2"
+            if [ "$ApstraUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--Apstrapwd)
+            ApstraPWD="$2"
+            if [ "$ApstraPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -o|--output)
+            LOGOUTPUT="$2"
+            shift # past argument
+            shift # past value
+        ;;
+        -c|--csv)
+            CSV=1
+            shift # past argument
+        ;;
+        -d|--dump)
+            DUMP=1
+            shift # past argument
+        ;;
+        -h|--help)
+            help-info
+            exit 0
+        ;;
+        -x)
+            DEBUG=1
+            shift
+        ;;
+        -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+            JDEBUG=1
+            DEBUG=1
+            shift
+        ;;
+        *)    # unknown option
+            POSITIONAL+=("$1") # save it in an array for later
+            shift # past argument
+        ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the Apstra login information is always required
+  if [ -z "$ApstraUID" ] || [ -z "$ApstraIP" ] || [ -z "$ApstraPWD" ]; then
+    echo ""; echo " You are missing >=1 Apstra parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+  # need to know where to dump the output too
+  if [ -n "$LOGOUTPUT" ] && [ ! -d "${LOGOUTPUT}/" ]; then
+    echo ""; echo " Output directory does not exist"; echo " ...exit()"
+    exit 1
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool prints a listing of all Security Zones and Virtual Networks"
+    echo "    currently provisioned in a Blueprint."
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Blueprint listing from Juniper Apstra"
+    echo ""
+    echo "  syntax: "
+    echo "      dumpSZVNs -ai|--Apstraip <Apstra-ip>     *"
+    echo "                -au|--Apstrauid <Apstra-uid>   *"
+    echo "                -ap|--Apstrapwd <Apstra-pwd>   *"
+    echo "                 -c| --csv"
+    echo "                 -d| --dump"
+    echo "                 -o| --output <directory>"
+    echo "                 -h|--help"
+    echo ""
+    echo "               * = required"
+    echo ""
+    echo "               -c use if you want the output in CSV format"
+    echo "               -d use to output additional details"
+    echo "               -o use to save the output to a specific directory"
+    echo "                      the produced files will be svout.csv if -c is also specified"
+    echo "                      otherwise the file will be svout.txt"
+    echo ""
+    echo "  Note: an * in the R column means the VLAN_ID is reserved across Blueprint"
+    echo "        a | in the VLANid column means multiple VLAN_IDs are in use for"
+    echo "            the VNI ... example Leaf1 uses VLAN_ID 999 and Leaf2 uses 1000"
+    echo "                                for VNI 30000"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initApstraIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    ApstraIP=$initApstraIP
+  else
+    echo " IP address for From Apstra is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/Apstratoken.json
+  rm -f -- /tmp/szvnawk
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request Apstra Token
+  cat > /tmp/Apstratoken.json <<EOF
+{
+  "username":"${ApstraUID}",
+  "password": "${ApstraPWD}"
+}
+EOF
+}
+#####
+#
+#  Build awk file used by do-output and do-CSVoutput
+#
+#####
+build-awk(){
+  # need to escape(ie \) the $ for the awk fields to avoid bash processing them
+  cat > /tmp/szvnawk <<EOF
+BEGIN {}
+{if (\$8 != "") {r="*"} else {r=" "}}
+\$6 ~/vxlan/ {vx=\$7; if (\$8 == "") {vi=\$NF} else {vi=\$8}};
+\$6 ~/vlan/ {vx=\$8; vi=\$7};
+{if (csv == "1" && dump == "1") {
+     {printf("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",\$1,\$2,\$3,\$4,\$5,\$6,vx,r,vi,\$9,\$10,\$11)}
+ } else if (csv == "0" && dump == "1") {
+     {printf("%-20s  %5s  %5s  %36s  %-30s  %5s  %7s  %1s  %6s  %18s  %27s  %-15s\n",\$1,\$2,\$3,\$4,\$5,\$6,vx,r,vi,\$9,\$10,\$11)}
+ } else if (csv == "1" && dump == "0") {
+     {printf("%s,%s,%s,%s,%s,%s,%s\n",\$1,\$2,\$3,\$5,vx,r,vi)}
+ } else if (csv == "0" && dump == "0") {
+     {printf("%-20s  %5s  %5s  %-30s  %7s  %1s  %6s\n",\$1,\$2,\$3,\$5,vx,r,vi)}
+ }
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for Apstra
+#
+#####
+get-tokens(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(FromIP) $ApstraIP"; fi
+  if [ $NOTSILENT -eq 1 ]; then echo " Getting Apstra Authentication Tokens"; fi
+  Apstratoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/Apstratoken.json -X POST https://$ApstraIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-Token) K:(Token) $Apstratoken"; fi
+}
+#####
+#
+# called by main() to get a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the Apstra server
+  BPFlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints |
+           jq '.items[] | .label, .id' | sed 'N;s/\n/,/' | sed -e 's/ /~/g' | sed -e 's/"//g') )
+  BPFlistelements=${#BPFlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $BPFlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPFdetails(){
+  echo " Blueprints:"
+  for((ij=0;ij<$BPFlistelements;ij++))
+  do
+    BPFname=`echo "${BPFlist[ij]}" | cut -d',' -f1 | sed -e 's/ /~/g'`
+    BPFUUID=`echo "${BPFlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPFname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFUUID) $BPFUUID"; fi
+
+    BPFitem=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${BPFUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPFitemelements=${#BPFitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFlistelements) $BPFlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFitemelements) $BPFitemelements"; fi
+    #do-BPdetails
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  fromBPname=`echo "${BPFlist[fromsponse]}" | cut -d',' -f1 | sed -e 's/~/ /g'`
+  fromBPUUID=`echo "${BPFlist[fromsponse]}" | cut -d',' -f2`
+}
+
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"FROM\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     case $fromsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# called by main() to get each SZ's NAME, UUID, VNI, and VID from the BP
+#
+#####
+get-SZlist(){
+  echo " Getting all Security Zones"
+  #create an array of all the SZs for the Blueprint defined in the AOS server
+  #
+  # jq explained
+  #    read in each sercurity_zones entry
+  #    keep specific fields
+  #    output as a single string
+  #
+  SZlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${fromBPUUID}/security-zones |
+          jq -r '.items[] | "\(.vrf_name),\(.id),\(.vni_id),\(.vlan_id)"' | sort -t ',' -k1 | sed -e 's/"//g') )
+  SZlistelements=${#SZlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-SZlist) K:(SZlistelements) $SZlistelements"; print-SZlist; fi
+}
+#####
+#
+# called by main() to get each VN's SZUUID, Name, Type, VNI, VID, and IPs from the BP
+#
+#####
+get-VNlist(){
+  echo " Getting all Virtural Networks"
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNlist) K:(fromBPUUID) $fromBPUUID"; fi
+  #create an array of all the VNs for the Blueprint defined in the AOS server
+  #
+  # jq explained
+  #    read in each virtual_networks entry
+  #    combine all the vlan_id field from any bound_to entries
+  #    keep specific fields
+  #    output as a single string
+  #
+  VNlist=( $(curl -s -H "AuthToken: ${Apstratoken}" -H "Content-Type: application/json" -k -X GET https://$ApstraIP/api/blueprints/${fromBPUUID}/virtual-networks |
+    jq -r '.virtual_networks[] | {
+       security_zone_id: (.security_zone_id // null),
+       label: (.label // null),
+       vn_type: (.vn_type // null),
+       vn_id: (.vn_id // null),
+       reserved_vlan_id: (.reserved_vlan_id // null),
+       vlan_ids: ((.bound_to | map(.vlan_id) | unique | join("|")) // null),
+       ipv4_subnet: (.ipv4_subnet // null),
+       ipv6_subnet: (.ipv6_subnet // null)
+    } | "\(.security_zone_id),\(.label),\(.vn_type),\(.vn_id // ""),\(.reserved_vlan_id // ""),\(.ipv4_subnet // ""),\(.ipv6_subnet // ""),\(.vlan_ids)"' ) )
+  VNlistelements=${#VNlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNlist) K:(VNlistelements) $VNlistelements"; print-VNlist; fi
+}
+#####
+#
+# called by main() to match up VNs with SZs
+#
+#####
+do-MatchUp (){
+  # loop through the SZlist
+  for((ij=0;ij<$SZlistelements;ij++))
+  do
+    SZname=`echo "${SZlist[ij]}" | cut -d',' -f1`
+    SZUUID=`echo "${SZlist[ij]}" | cut -d',' -f2`
+    SZVNI=`echo "${SZlist[ij]}" | cut -d',' -f3`
+    SZVID=`echo "${SZlist[ij]}" | cut -d',' -f4`
+    # loop through the VNlist and check for a match
+    for((iv=0;iv<$VNlistelements;iv++))
+    do
+      if  [[ "${VNlist[iv]}" == *"$SZUUID"* ]]; then
+        # if a match, added to the Matchedlist array
+        SZVNstring=`echo ${SZname},${SZVNI},${SZVID},${VNlist[iv]}`
+        Matchedlist+=("$SZVNstring")
+        if [ $DEBUG -eq 1 ]; then jout=`echo $SZname  $SZUUID ${VNlist[iv]}`; output-debug "R:(do-MatchUp) K:(VNlist) Match $jout"; fi
+      else
+        if [ $DEBUG -eq 1 ]; then jout=`echo $SZname  $SZUUID ${VNlist[iv]}`; output-debug "R:(do-MatchUp) K:(VNlist) No Match $jout"; fi
+      fi
+    done
+  done
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-MatchUp) K:(Matchelist)"; print-Matchlist; fi
+  }
+#####
+#
+# called by main() to print the results in CSV format
+#
+#####
+do-CSVoutput(){
+  MatchedNumItems=${#Matchedlist[@]}
+  if [ -n "$LOGOUTPUT" ] && [ $DUMP -eq 1 ]; then
+    echo "SZname,SZVNI,SZVID,SZUUID,VNname,Type,VXLANid,R,VLANid,IPv4,IPv6,BoundTo"> $LOGOUTPUT/svout.csv
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk >> $LOGOUTPUT/svout.csv
+    done
+  elif [ -n "$LOGOUTPUT" ] && [ $DUMP -eq 0 ]; then
+    echo "SZname,SZVNI,SZVID,VNname,VXLANid,R,VLANid" > $LOGOUTPUT/svout.csv
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk >> $LOGOUTPUT/svout.csv
+    done
+  elif [ -z "$LOGOUTPUT" ] && [ $DUMP -eq 1 ]; then
+    echo "SZname,SZVNI,SZVID,SZUUID,VNname,Type,VXLANid,R,VLANid,IPv4,IPv6,BoundTo"
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk
+    done
+  elif [ -z "$LOGOUTPUT" ] && [ $DUMP -eq 0 ]; then
+    echo "SZname,SZVNI,SZVID,VNname,VXLANid,R,VLANid"
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk
+    done
+  fi
+}
+#####
+#
+# called by main() to print the results in column output
+#
+#####
+do-output(){
+  MatchedNumItems=${#Matchedlist[@]}
+  if [ -n "$LOGOUTPUT" ] && [ $DUMP -eq 1 ]; then
+    echo "SZname                SZVNI  SZVID  SZUUID                                VNname                          Type   VXLANid  R  VLANid  IPv4                IPv6                         BoundTo" > $LOGOUTPUT/svout.txt
+    echo "--------------------  -----  -----  ------------------------------------  ------------------------------  -----  -------  -  ------  ------------------  ---------------------------  ---------------" >> $LOGOUTPUT/svout.txt
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk >> $LOGOUTPUT/svout.txt
+    done
+  elif [ -n "$LOGOUTPUT" ] && [ $DUMP -eq 0 ]; then
+    echo "SZname                SZVNI  SZVID  VNname                          VXLANid  R  VLANid" > $LOGOUTPUT/svout.txt
+    echo "--------------------  -----  -----  ------------------------------  -------  -  ------ " >> $LOGOUTPUT/svout.txt
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk >> $LOGOUTPUT/svout.txt
+    done
+  elif [ -z "$LOGOUTPUT" ] && [ $DUMP -eq 1 ]; then
+    echo "SZname                SZVNI  SZVID  SZUUID                                VNname                          Type   VXLANid  R  VLANid  IPv4                IPv6                         BoundTo"
+    echo "--------------------  -----  -----  ------------------------------------  ------------------------------  -----  -------  -  ------  ------------------  ---------------------------  ---------------"
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk
+    done
+  elif [ -z "$LOGOUTPUT" ] && [ $DUMP -eq 0 ]; then
+    echo "SZname                SZVNI  SZVID  VNname                          VXLANid  R  VLANid"
+    echo "--------------------  -----  -----  ------------------------------  -------  -  ------ "
+    for((sv=0;sv<$MatchedNumItems;sv++))
+    do
+      echo "${Matchedlist[sv]}" |
+      awk -F, -v csv=$CSV -v dump=$DUMP -f /tmp/szvnawk
+    done
+  fi
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+# Called to dump the content of the SZlist array
+print-SZlist(){
+  echo "DEBUG: SZ LIST"
+  for((ij=0;ij<$SZlistelements;ij++))
+  do
+    echo "DEBUG: SZ: ${SZlist[ij]}"
+  done
+}
+# Called to dump the content of the VNlist array
+print-VNlist(){
+  echo "DEBUG: VN LIST"
+  for((ij=0;ij<$VNlistelements;ij++))
+  do
+    echo "DEBUG: VN: ${VNlist[ij]}"
+  done
+}
+# Called to dump the content of the "matched" array
+print-Matchlist(){
+  MatchedNumItems=${#Matchedlist[@]}
+  echo "DEBUG: Matched List ... count $MatchedNumItems"
+  for((sv=0;sv<$MatchedNumItems;sv++))
+  do
+    echo "DEBUG: Matched: ${Matchedlist[sv]}"
+  done
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+build-awk
+get-tokens
+get-BPlist
+get-BPFdetails
+get-SZlist
+get-VNlist
+do-MatchUp
+if [ $CSV -eq 1 ]; then do-CSVoutput; else do-output; fi
+if [ $DEBUG -eq 0 ]; then clear-json; fi
