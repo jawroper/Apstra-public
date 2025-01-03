@@ -1,0 +1,390 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: CTcopy
+#  PURPOSE: Used to copy all CTs from 1 Blueprint to another Blueprint
+#                for AOS 5.x
+#
+#  CREATED: 08/11/21
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 12/31/24
+#  BY: Jay A Wilson
+#  VERSION: 2.01
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#      v2.00 = updated for AOS 5.x.
+#              5.x does not support a simple export and import for CTs
+#              VNs must be queried and vn_ids retrieved for cross referencing
+#       2.01 = updated the help information
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -ai|--AOSip)
+            initAOSIP="$2"
+            if [ "$initAOSIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosip
+        ;;
+        -au|--AOSuid)
+            AOSUID="$2"
+            if [ "$AOSUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ap|--AOSpwd)
+            AOSPWD="$2"
+            if [ "$AOSPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+          -h|--help)
+              help-info
+              exit 0
+          ;;
+          -x)
+              DEBUG=1
+              shift
+          ;;
+          -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+              JDEBUG=1
+              DEBUG=1
+              shift
+          ;;
+          *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+              shift # past argument
+          ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the AOS login information is always required
+  if [ -z "$AOSUID" ] || [ -z "$AOSIP" ] || [ -z "$AOSPWD" ]; then
+    echo ""; echo " You are missing >=1 AOS parms: -ai, -au, and/or -ap"; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool allows you to copy all CTs via REST"
+    echo "    from a Blueprint to another Blueprint that is managed by"
+    echo "    the same Apstra server."
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Blueprint listing from Juniper AOS,"
+    echo "        user selects Blueprint to copy from, and"
+    echo "        the Blueprint to copy to."
+    echo ""
+    echo ""
+    echo "  syntax: "
+    echo "      CTcopy -ai|--AOSip <hb-ip>     *"
+    echo "             -au|--AOSuid <hb-uid>   *"
+    echo "             -ap|--AOSpwd <hb-pwd>   *"
+    echo "             -h|--help"
+    echo ""
+    echo "             * = required"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initAOSIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    AOSIP=$initAOSIP
+  else
+    echo " IP address AOS is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  Called to output uniform DEBUG messages when -x arg is passed
+#
+#####
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+#####
+#
+#  called by main() to clear the files the "curl" statements will use for input
+#
+#####
+clear-json(){
+  rm -f /tmp/AOStoken.json 2>/dev/null
+  rm -f /tmp/objpolicy.json 2>/dev/null
+  rm -f /tmp/VNFroms 2>/dev/null
+  rm -f /tmp/VNTos 2>/dev/null
+  rm -f /tmp/VNcombined 2>/dev/null
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request AOS Token
+  cat > /tmp/AOStoken.json <<EOF
+{
+  "username":"${AOSUID}",
+  "password": "${AOSPWD}"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for AOS
+#
+#####
+get-tokens(){
+  if [ $NOTSILENT -eq 1 ]; then echo " Getting AOS Authentication Token"; fi
+  AOStoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/AOStoken.json -X POST https://$AOSIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the AOS server
+  BPlist=( $(curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints |
+          jq '.items[] | .id, .label' | sed -e 's/ /_/g' |
+          sed 'N;s/\n/,/' | sed -e 's/"//g') )
+  BPlistelements=${#BPlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPs) K:(BPlistelements) $BPlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPdetails(){
+  echo "Which Blueprint to copy from:"
+  for((ij=0;ij<$BPlistelements;ij++))
+  do
+    BPname=`echo "${BPlist[ij]}" | cut -d',' -f2`
+    BPUUID=`echo "${BPlist[ij]}" | cut -d',' -f1`
+    echo $ij" "$BPname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(BPname) $BPname  K:(BPUUID) $BPUUID"; fi
+
+    BPitem=( $(curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints/${BPUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPitemelements=${#BPitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(BPname) $BPname  K:(BPlistelements) $BPlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(BPname) $BPname  K:(BPitemelements) $BPitemelements"; fi
+    #do-BPdetails
+  done
+  jcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  get-BPtoNumber
+}
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo "Input from Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jcnt" ]; then
+        loop2=1
+     fi
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# called by get-BPdetails() to get user input as to the TO BP
+#
+#####
+get-BPtoNumber(){
+  loop2=0
+  echo ""
+  echo "Input to Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read tosponse
+     if [ "$tosponse" -ge "0" ] && [ "$tosponse" -le "$jcnt" ]; then
+       if [ "$tosponse" == "$fromsponse" ]; then
+         echo "From and To can not be the same number. Try again! "
+       else
+        loop2=1
+       fi
+     fi
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(tosponse) $tosponse"; fi
+  done
+}
+#####
+#
+# called by main() to get the VN UUIDs from the FROM BP
+#
+#####
+get-VNFromIDs(){
+  fromBPname=`echo "${BPlist[fromsponse]}" | cut -d',' -f2`
+  fromBPUUID=`echo "${BPlist[fromsponse]}" | cut -d',' -f1`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNFromIDs) K:(fromBPname) $fromBPname  K:(fromBPUUID) $fromBPUUID"; fi
+  rm /tmp/VNFroms 2>/dev/null
+  # get the subpolicy that points to a VN UUID
+  for svkmh in `curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints/${fromBPUUID}/obj-policy-export |
+  jq -r '[.policies[] | select(.policy_type_name != "pipeline" and .policy_type_name != "batch")| .attributes.vn_node_id] | unique | .[]' | sed 's/\"//g'`
+  do
+    curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints/${fromBPUUID}/virtual-networks/${svkmh} |
+    jq '"\(.id),\(.vn_id)"' >> /tmp/VNFroms
+  done
+  sed -i '' -e 's/"//g' /tmp/VNFroms
+}
+#####
+#
+# called by main() to get the VN UUIDs and VN IDs from the TO BP
+#
+#####
+get-VNToIDs(){
+  toBPname=`echo "${BPlist[tosponse]}" | cut -d',' -f2`
+  toBPUUID=`echo "${BPlist[tosponse]}" | cut -d',' -f1`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNToIDs) K:(toBPname) $toBPname  K:(toBPUUID) $toBPUUID"; fi
+  # Retrieve the VN UUID listing and each associated VN_ID
+  curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints/${toBPUUID}/virtual-networks |
+  jq '.virtual_networks[] | "\(.id),\(.vn_id)"' |   sed -e 's/"//g' > /tmp/VNTos
+}
+#####
+#
+# called by main() to combine the VN UUIDs in the FROM BP with the TO BP
+#
+#####
+do-VNcombine(){
+  awk -F, '
+  NR == FNR {  # Process /tmp/VNFroms first
+    # Store the values in an array
+    # use the vn_id as the index for each array element and store the id in it
+    fromvninfo[$2] = $1;
+    next;
+  }
+
+  # Process /tmp/VNTos now
+  {
+    # Extract the vn_id from /tmp/VNTos
+    svalue = $2;
+    # If the value exists in the fromvninfo array, print it
+    if (svalue in fromvninfo) {
+      print $0 "," fromvninfo[svalue];
+    }
+  }
+' /tmp/VNTos /tmp/VNFroms > /tmp/VNcombined
+}
+#####
+#
+# called by main() to retrieve CTs from the FROM BP
+#
+#####
+get-CTFrom(){
+  echo ""
+  echo "Retrieving CTs from the FROM BP"
+  fromBPname=`echo "${BPlist[fromsponse]}" | cut -d',' -f2`
+  fromBPUUID=`echo "${BPlist[fromsponse]}" | cut -d',' -f1`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-CTFrom) K:(fromBPname) $fromBPname  K:(fromBPUUID) $fromBPUUID"; fi
+  toBPname=`echo "${BPlist[tosponse]}" | cut -d',' -f2`
+  toBPUUID=`echo "${BPlist[tosponse]}" | cut -d',' -f1`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-CTFrom) K:(toBPname) $toBPname  K:(toBPUUID) $toBPUUID"; fi
+  objpolicy=`curl -s -H "AuthToken: ${AOStoken}" -H "Content-Type: application/json" -k -X GET https://$AOSIP/api/blueprints/${fromBPUUID}/obj-policy-export`
+  echo $objpolicy | jq '.' > /tmp/objpolicy.json
+  do-obj-mod
+  #curl -s -k -H "AuthToken: ${AOStoken}"  -H "Content-Type: application/json" --data-binary @/tmp/objpolicy.json -X PUT https://$AOSIP/api/blueprints/${toBPUUID}/obj-policy-import
+}
+#####
+#
+# called by get-CTFrom() to update the TO BPs CT Policies with the new UUIDs
+#
+#####
+do-obj-mod(){
+  # modified the saved CT Policies file with the new UUIDs
+  for combinedlist in `cat /tmp/VNcombined`; do
+    vnuuidold=`echo "${combinedlist}" | cut -d',' -f1`
+    jvnid=`echo "${combinedlist}" | cut -d',' -f2`
+    vnuuidnew=`echo "${combinedlist}" | cut -d',' -f3`
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(do-obj-mod) K:(vnid) $jvnid  K:(vnuuidold) $vnuuidold  K:(vnuuidnew) $vnuuidnew"; fi
+    sed -i '' "s/$vnuuidold/$vnuuidnew/g" /tmp/objpolicy.json
+  done
+}
+#####
+#
+# called by main() to push the modified CTs into the TO BP
+#
+#####
+do-CTTo(){
+  echo ""
+  echo "Installing CTs in the TO BP"
+  toBPname=`echo "${BPlist[tosponse]}" | cut -d',' -f2`
+  toBPUUID=`echo "${BPlist[tosponse]}" | cut -d',' -f1`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-CTTo) K:(toBPname) $toBPname  K:(toBPUUID) $toBPUUID"; fi
+  curl -s -k -H "AuthToken: ${AOStoken}"  -H "Content-Type: application/json" --data-binary @/tmp/objpolicy.json -X PUT https://$AOSIP/api/blueprints/${toBPUUID}/obj-policy-import
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+get-tokens
+get-BPlist
+get-BPdetails
+get-VNFromIDs
+get-VNToIDs
+do-VNcombine
+get-CTFrom
+do-CTTo
+if [ $DEBUG -eq 0 ]; then clear-json; fi

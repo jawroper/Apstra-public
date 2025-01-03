@@ -1,0 +1,988 @@
+#!/bin/bash
+########
+#
+#
+#  NAME: eRVC
+#  PURPOSE: Used to copy all RZs, VNs, and Configlets  from 1 Blueprint in an
+#                Apstra 5.x server to 1 Blueprint in another Apstra 5.x server
+#
+#  CREATED: 10/04/21
+#  BY: Jay A Wilson
+#
+#  LAST MOD: 12/31/24
+#  BY: Jay A Wilson
+#  VERSION: 2.00
+#
+#  MODIFICATION HISTORY:
+#      v1.00 = Initial Release
+#      v1.01 = added -s option to curl command in get-FromCNFs
+#              added echo statement at the end of do-ToCNFcopy
+#      v1.02 = added support for 4.1.x
+#                    changed get-BPList to place label before ID
+#              added get-version to retrieve the From and To AOS Versions
+#     v1.05  = added support for changes to Route-Zones Routing policies
+#                    in >= 4.1. changes are in do-RZcopy
+#     v2.00  = updated for version 5.x
+#                    added do-CNFunique because => 5.0 default Configlets exist
+#
+#
+#
+########
+
+# GLOBAL VARs
+
+DEBUG=0
+JDEBUG=0
+DSELECT=0
+NOTSILENT=1
+CLEAN=0
+MUEXC=0
+LASTARGCHECK=0
+FOUNDLOADDEV=0
+
+
+argcnt=$#
+args=("$@")
+###########
+#
+# called by main() to process the arguments
+#
+###########
+do-args(){
+  set -- "${args[@]}"
+  while [[ $# -gt 0 ]]
+  do
+      key=`echo "$1" | tr '[:upper:]' '[:lower:]'`
+      case $key in
+        -afi|--AOSFromip)
+            initAOSFromIP="$2"
+            if [ "$initAOSFromIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aosfip
+        ;;
+        -afu|--AOSFromuid)
+            AOSFromUID="$2"
+            if [ "$AOSFromUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -afp|--AOSFrompwd)
+            AOSFromPWD="$2"
+            if [ "$AOSFromPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -ati|--AOSToip)
+            initAOSToIP="$2"
+            if [ "$initAOSToIP" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+            valid-aostip
+        ;;
+        -atu|--AOSTouid)
+            AOSToUID="$2"
+            if [ "$AOSToUID" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+        -atp|--AOSTopwd)
+            AOSToPWD="$2"
+            if [ "$AOSToPWD" == "" ]; then LASTARGCHECK=1; fi
+            shift # past argument
+            shift # past value
+        ;;
+          -h|--help)
+              help-info
+              exit 0
+          ;;
+          -x)
+              DEBUG=1
+              shift
+          ;;
+          -xj)  # normal DEBUG + DUMP returned JSON returned from curl
+              JDEBUG=1
+              DEBUG=1
+              shift
+          ;;
+          *)    # unknown option
+              POSITIONAL+=("$1") # save it in an array for later
+              shift # past argument
+          ;;
+      esac
+  done
+  set -- "${POSITIONAL[@]}"
+  # verify that if the argument specificed on the command line requires a parm
+  #    that the parm was specificed and not forgotten to be entried
+  if [ $LASTARGCHECK -eq 1 ]; then
+    echo ""; echo " The Last argument on the command is missing it's required parm"; echo " ...exit()"
+    exit 1
+  fi
+  # all the AOS login information is always required
+  if [ -z "$AOSFromUID" ] || [ -z "$AOSFromIP" ] || [ -z "$AOSFromPWD" ] ||
+     [ -z "$AOSToUID" ] || [ -z "$AOSToIP" ] || [ -z "$AOSToPWD" ]; then
+    echo ""; echo " You are missing >=1 AOS parms: -afi, -afu, -afp, -ati, -atu, and/or -atp"; echo " ...exit()"
+    exit 1
+  fi
+  # verify that jq is installed
+  if [ -z `which jq` ]; then
+    echo " "; echo " The package \"jq\" must be installed to use this script"
+    echo " "; echo " Download and installation instructions can be found at:"
+    echo " "; echo "     https://https://stedolan.github.io/jq/download/"
+    echo " "; echo " ...exit()"
+    exit 1
+  fi
+}
+########
+#
+#  Called by do-args() if --help was specified as the command arg
+#
+#######
+help-info(){
+    echo ""
+    echo "  This tool allows you to copy all Routing Zones, Virtual Networks, and"
+    echo "    Configlets via REST from a Blueprint to another Blueprint that is"
+    echo "    managed by a different Apstra server."
+    echo ""
+    echo "  Capabilities provided are:"
+    echo "      Retrieve Blueprint listing from Juniper Apstra"
+    echo "      User selects the Blueprint to copy from"
+    echo "      User selects the Blueprint to copy to"
+    echo "      User selects the Routing Zones to copy"
+    echo "      User selects the Virtual Networks to copy"
+    echo ""
+    echo "  NOTES: "
+    echo "        1) The 'default' RZ is not copied"
+    echo "        2) The assumption is the 'TO' Blueprint is instantiated, but"
+    echo "           has Routing Zones and Virtual Networks that are in their"
+    echo "           default initialized states"
+    echo ""
+    echo "  syntax: "
+    echo "      eRVC -afi|--AOSFromip <hb-ip>     *"
+    echo "           -afu|--AOSFromuid <hb-uid>   *"
+    echo "           -afp|--AOSFrompwd <hb-pwd>   *"
+    echo "           -ati|--AOSToip <hb-ip>     *"
+    echo "           -atu|--AOSTouid <hb-uid>   *"
+    echo "           -atp|--AOSTopwd <hb-pwd>   *"
+    echo "           -h|--help"
+    echo ""
+    echo "           * = required"
+    echo ""
+}
+#####
+#
+#  Called to varify IP addresses passed as parms are syntax correct
+#
+#####
+valid-aosfip(){
+  rx='([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])'
+  if [[ $initAOSFromIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    AOSFromIP=$initAOSFromIP
+  else
+    echo " IP address for From AOS is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+valid-aostip(){
+  if [[ $initAOSToIP =~ ^$rx\.$rx\.$rx\.$rx$ ]]; then
+    AOSToIP=$initAOSToIP
+  else
+    echo " IP address for To AOS is not valid"; echo " ...exit()"
+    exit 1
+  fi
+}
+#####
+#
+#  called by main() to clear the tmp files used
+#
+#####
+clear-json(){
+  rm -f -- /tmp/AOSFromtoken.json
+  rm -f -- /tmp/AOSTotoken.json
+  rm -f -- /tmp/RZfromlist
+  rm -f -- /tmp/RZtolist
+  rm -f -- /tmp/RZlist
+  rm -f -- /tmp/VNlistmod
+  rm -f -- /tmp/rdgrp
+  rm -f -- /tmp/CNFtmp
+  rm -f -- /tmp/CNFfromlist
+  rm -f -- /tmp/FromBPCNFs
+}
+#####
+#
+#  Build the json needed to ask for a Keystone token for all the other
+#  curl calls to the Controller
+#
+#####
+build-tokens(){
+  # JSON to request AOS Token
+  cat > /tmp/AOSFromtoken.json <<EOF
+{
+  "username":"${AOSFromUID}",
+  "password": "${AOSFromPWD}"
+}
+EOF
+cat > /tmp/AOSTotoken.json <<EOF
+{
+"username":"${AOSToUID}",
+"password": "${AOSToPWD}"
+}
+EOF
+}
+#####
+#
+#  called my main() to get tokens for AOS
+#
+#####
+get-tokens(){
+  if [ $NOTSILENT -eq 1 ]; then echo " Getting AOS Authentication Tokens"; fi
+  AOSFromtoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/AOSFromtoken.json -X POST https://$AOSFromIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+  AOSTotoken=`curl -s -k -H "Content-Type: application/json" --data-binary @/tmp/AOSTotoken.json -X POST https://$AOSToIP/api/aaa/login |
+  awk '/token/ {print $2};{next}' |
+  sed -e 's/",//' -e 's/^"//'`
+}
+#####
+#
+# called by main() to get a listing of all defined blueprints
+#
+#####
+get-BPlist(){
+  #create and array of all the Blueprints defined in the AOS server
+  BPFlist=( $(curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/blueprints |
+           jq '.items[] | .label, .id' | sed -e 's/ /_/g'  | sed 'N;s/\n/,/' | sed -e 's/"//g') )
+  BPFlistelements=${#BPFlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFs) K:(BPFlistelements) $BPFlistelements"; fi
+  BPTlist=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/blueprints |
+          jq '.items[] | .label, .id' | sed -e 's/ /_/g'  | sed 'N;s/\n/,/' | sed -e 's/"//g') )
+  BPTlistelements=${#BPTlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPTs) K:(BPTlistelements) $BPTlistelements"; fi
+}
+#####
+#
+# called by main() to get the details of each blueprint
+#
+#####
+get-BPFdetails(){
+  echo " From Blueprints:"
+  for((ij=0;ij<$BPFlistelements;ij++))
+  do
+    BPFname=`echo "${BPFlist[ij]}" | cut -d',' -f1`
+    BPFUUID=`echo "${BPFlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPFname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFUUID) $BPFUUID"; fi
+
+    BPFitem=( $(curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/blueprints/${BPFUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPFitemelements=${#BPFitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFlistelements) $BPFlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPFdetails) K:(BPFname) $BPFname  K:(BPFitemelements) $BPFitemelements"; fi
+    #do-BPdetails
+  done
+  jfcnt=$(( $ij - 1 ))
+  get-BPfromNumber
+  fromBPname=`echo "${BPFlist[fromsponse]}" | cut -d',' -f1`
+  fromBPUUID=`echo "${BPFlist[fromsponse]}" | cut -d',' -f2`
+}
+get-BPTdetails(){
+  echo " To Blueprints:"
+  for((ij=0;ij<$BPTlistelements;ij++))
+  do
+    BPTname=`echo "${BPTlist[ij]}" | cut -d',' -f1`
+    BPTUUID=`echo "${BPTlist[ij]}" | cut -d',' -f2`
+    echo $ij" "$BPTname
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPTdetails) K:(BPTname) $BPTname  K:(BPTUUID) $BPTUUID"; fi
+
+    BPTitem=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/blueprints/${BPTUUID}/experience/web/system-info |
+            awk 'BEGIN { RS="," }; { print $0}' | grep -v server |
+            grep -A12 hostname | awk 'BEGIN { RS="--"}; {print $0}' |
+            grep -e system_id -e role | sed 'N;s/\n/,/' |
+            grep -v null | sed 's/",//' | sed 's/"//g') )
+    BPTitemelements=${#BPTitem[@]}
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPTdetails) K:(BPTname) $BPTname  K:(BPTlistelements) $BPTlistelements K:(ij) $ij"; fi
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPTdetails) K:(BPTname) $BPTname  K:(BPTitemelements) $BPTitemelements"; fi
+    #do-BPdetails
+  done
+  jtcnt=$(( $ij - 1 ))
+  get-BPtoNumber
+  toBPname=`echo "${BPTlist[tosponse]}" | cut -d',' -f1`
+  toBPUUID=`echo "${BPTlist[tosponse]}" | cut -d',' -f2`
+}
+#####
+#
+# called by get-BPdetails() to get user input as to the FROM BP
+#
+#####
+get-BPfromNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"FROM\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read fromsponse
+     case $fromsponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$fromsponse" -ge "0" ] && [ "$fromsponse" -le "$jfcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(fromsponse) $fromsponse"; fi
+  done
+}
+#####
+#
+# called by get-BPdetails() to get user input as to the TO BP
+#
+#####
+get-BPtoNumber(){
+  loop2=0
+  echo ""
+  echo " Input \"TO\" Number "
+  while [ $loop2 -eq 0 ]
+  do
+     read tosponse
+     case $tosponse in
+       [0-9]|[1-9][0-9]|[1-9][0-9][0-9]|[1-9][0-9][0-9][1-9])
+          if [ "$tosponse" -ge "0" ] && [ "$tosponse" -le "$jtcnt" ]; then
+             loop2=1
+          else
+             echo " Number entered is not a valid selection...try again"
+          fi
+          ;;
+       *) echo " Invalid character...try again"
+          ;;
+     esac
+     if [ $DEBUG -eq 1 ]; then output-debug "R:(get-BPdetails) K:(tosponse) $tosponse"; fi
+  done
+}
+#####
+#
+# called by main() to get all single switch RACKs in the TO BP and
+#    if only double switch RACKs exist, get the 1st one
+#
+#####
+get-RACKStolist(){
+  echo ""
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-RACKStolist) K:(toBPUUID) $toBPUUID"; fi
+  #
+  # jq explained
+  #    read in each items entry
+  #    select Racks that only have 1 leaf switch in them
+  #    output only the UUIDs and the Labels of all single leaf Rack Switches
+  #
+  RACKStolist=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/blueprints/${toBPUUID}/racks |
+  jq -rc '.items[] | select((.leafs | length) == 1) | .leafs[].id, .leafs[].label') )
+  RACKStolistelements=${#RACKStolist[@]}
+  # if there are no single switch racks, garb the 1st redundant rack
+  #    this requires finding the redundancy_group ID for the rack
+  if [ $RACKStolistelements -eq 0 ]; then
+    RACKStotmplist=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/blueprints/${toBPUUID}/racks |
+    jq -rc '.items[] | select((.leafs | length) == 2) | .leafs[].id, .leafs[].label') )
+    RACKStotmplistelements=${#RACKStotmplist[@]}
+    build-qe-redundancy_group
+    RACKStolist=()
+    # redundent RACKs return 2 entries. need to join the UUID with the name,
+    #    sort unique entries, and then split the UUID from the name
+    RACKStolist=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X POST https://$AOSToIP/api/blueprints/${toBPUUID}/qe --data-binary @/tmp/rdgrp |
+    jq -rc '.items[] | .rg.id, .rg.label' | sed 'N;s/\n/,/' | sort -u | awk -F"," '{printf("%s\n%s\n",$1,$2)}') )
+    RACKStolistelements=${#RACKStolist[@]}
+  fi
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-RACKStolist) K:(RACKStolistelements) $RACKStolistelements"; print-RACKStolist; fi
+}
+#####
+#
+# called by main() to get each VNs from the FROM BP
+#
+#####
+get-VNfromlist(){
+  echo " Getting all \"FROM\" Blueprint Virtural Networks"
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNfromlist) K:(fromBPUUID) $fromBPUUID"; fi
+  #
+  # jq 1 explained
+  #    read in each virtual_networks entry
+  #    delete the .id field in each entry
+  #    set each system_id in each bound_to entry in each virtual_network to a dummy_entry"_SFOY_"
+  #    produce an array as output (that's the [ ] around the whole jq)
+  # jq 2 explained
+  #    remove duplicate bound_to entry in each virtual_network
+  # jq 3 explained
+  #    output each virtual_network as a "record"/"row" that's what the -c and [] do
+  #
+  VNfromlist=( $(curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/blueprints/${fromBPUUID}/virtual-networks |
+  jq '[.virtual_networks[] | del(.id)| (.bound_to[].system_id) |= "_SFOY_"]' |
+  jq 'map( .bound_to |= unique )' | jq -c '.[]') )
+  VNfromlistelements=${#VNfromlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-VNfromlist) K:(VNfromlistelements) $VNfromlistelements"; print-VNfromlist; fi
+}
+#####
+#
+# called by main() to create the TO BP Virtual Networks based on FROM BP Virtual
+#        Networks but modified with a RZ UUIDs of the TO BP and a RACK UUID of
+#        the TO BP RZ
+#
+#####
+do-VNlistmod(){
+  echo " Creating \"TO\" Blueprint Virtural Networks"
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-VNlistmod)"; fi
+  # save the VN records for the "from" BP into a file
+  for((ij=0;ij<$VNfromlistelements;ij++))
+  do
+    echo "${VNfromlist[ij]}" >> /tmp/VNlistmod
+  done
+  # load all entries rows in /tmp/RZlist into an array
+  RZtofrom=( $(cat /tmp/RZlist) )
+  RZtofromelements=${#RZtofrom[@]}
+  # for each row, split into 3 variables
+  for((ij=0;ij<$RZtofromelements;ij++))
+  do
+    RZtofromName=`echo "${RZtofrom[ij]}" | cut -f1 -d,`
+    RZtofromFrom=`echo "${RZtofrom[ij]}" | cut -f2 -d,`
+    RZtofromTo=`echo "${RZtofrom[ij]}" | cut -f3 -d,`
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(do-VNlistmod) K:(RZtofromName) $RZtofromName K:(RZtofromFrom) $RZtofromFrom K:(RZtofromTo) $RZtofromTo "; fi
+    # substitute the correct from RZ id with the corrisponding to RZ id for each VN
+    # future dummy string check
+    sed -i ' ' -e "s|${RZtofromFrom}|${RZtofromTo}|g" /tmp/VNlistmod
+  done
+  # substitute the dummy Rack ID with the randomly selected Rack UUID from the "TO" BP
+  sed -i ' ' -e "s|_SFOY_|${RACKStolist[0]}|g" /tmp/VNlistmod
+}
+#####
+#
+# called by main() to get each RZ entry's VRF NAME AND UUID from the FROM BP
+#
+#####
+get-RZfromlist(){
+  echo " Getting all \"FROM\" Blueprint Routing Zones"
+  #create an array of all the RZs for the FROM Blueprint defined in the AOS server
+  #  ignore the "default" VRF because every BP has 1 by default.
+  RZfromlist=( $(curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/blueprints/${fromBPUUID}/security-zones |
+          jq -r '.items[] | select(.vrf_name != "default") | .vrf_name + "," + .id' | sort -t ',' -k1) )
+  RZfromlistelements=${#RZfromlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-RZfromlist) K:(RZfromlistelements) $RZfromlistelements"; print-RZfromlist; fi
+}
+#####
+#
+# called by main() to get each RZ entry's VRF NAME AND UUID from the TO BP
+#
+#####
+get-RZtolist(){
+  #create an array of all the RZs (VRF NAME and UUID) for the TO Blueprint defined in the AOS server
+  #  ignore the "default" VRF because every BP has 1 by default.
+  RZtolist=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/blueprints/${toBPUUID}/security-zones |
+          jq -r '.items[] | select(.vrf_name != "default") | .vrf_name + "," + .id' | sort -t ',' -k1) )
+  RZtolistelements=${#RZtolist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-RZtolist) K:(RZtolistelements) $RZtolistelements"; print-RZtolist; fi
+}
+#####
+#
+# called by main() to combine the RZ UUIDs from the FROM BP and the TO BP
+#
+#####
+do-RZcombine(){
+  if [ $RZALL -eq 1 ]; then
+    for((ij=0;ij<$RZfromlistelements;ij++))
+    do
+      echo "${RZfromlist[ij]}" >> /tmp/RZfromlist
+    done
+  else
+    for((ij=0;ij<$RZactivateelements;ij++))
+    do
+      echo "${RZactivatearray[ij]}" >> /tmp/RZfromlist
+    done
+  fi
+  # add the string _BPSF_ to the UUID this is used as a "key" to know
+  #     which RZs have been copied when processing VNs
+  for((ij=0;ij<$RZtolistelements;ij++))
+  do
+    echo "${RZtolist[ij]}_BPSF_" >> /tmp/RZtolist
+  done
+  # adding the select RZ logic means order could have changed
+  #        ensure the orders are sorted because join expects sorted files
+  if [ ! -f /tmp/RZtolist ]; then touch /tmp/RZtolist; fi
+  sort -o /tmp/RZtolist /tmp/RZtolist
+  sort -o /tmp/RZfromlist /tmp/RZfromlist
+  join -t',' -1 1 -2 1 /tmp/RZfromlist /tmp/RZtolist >> /tmp/RZlist
+}
+#####
+#
+# called by get-RACKStolist() to build the query to find the ID used
+#
+#####
+build-qe-redundancy_group(){
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(build-qe-redundancy_group)"; fi
+  tmpvar=`echo "{\"query\": \"match(node('redundancy_group', name='rg').out('composed_of_systems').node('system', role='leaf'))\"}"`
+  echo $tmpvar > /tmp/rdgrp
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(build-qe-redundancy) K:(RACKStotmplistelements) $RACKStotmplistelements  K:(RACKStotmplist[0]) ${RACKStotmplist[0]}"; fi
+}
+#####
+#
+# called by main() to allow the user to select which VNs to copy
+#
+#####
+ask-VNs(){
+  loop1=0
+  VNindex=0
+  VNarray=( $(cat /tmp/VNlistmod | jq -r '.label' | awk 'BEGIN{print "ALL"};{print $0}' | sort) )
+  VNnumelements=${#VNarray[@]}
+  activateindex=0
+  VNALL=0
+  #
+  # show 5 Virtual Networks at a time
+  #
+  while [ $loop1 -eq 0 ]
+  do
+    echo " Which Virtual Networks would you like to move:"
+    if [ $(($VNindex)) -lt $VNnumelements ]; then echo "   "$VNindex" "${VNarray[VNindex]}; fi
+    if [ $(($VNindex+1)) -lt $VNnumelements ]; then echo "   "$(($VNindex+1))" "${VNarray[VNindex+1]}; fi
+    if [ $(($VNindex+2)) -lt $VNnumelements ]; then echo "   "$(($VNindex+2))" "${VNarray[VNindex+2]}; fi
+    if [ $(($VNindex+3)) -lt $VNnumelements ]; then echo "   "$(($VNindex+3))" "${VNarray[VNindex+3]}; fi
+    if [ $(($VNindex+4)) -lt $VNnumelements ]; then echo "   "$(($VNindex+4))" "${VNarray[VNindex+4]}; fi
+    echo "   N = Next set of VNs"
+    loop2=0
+    while [ $loop2 -eq 0 ]
+    do
+       read l1esponse
+          case $l1esponse in
+              $(($VNindex)))
+                  activatearray[$activateindex]=${VNarray[VNindex]}
+                  activateindex=$(( $activateindex + 1 ))
+              ;;
+              $(($VNindex+1)))
+                  activatearray[$activateindex]=${VNarray[VNindex+1]}
+                  activateindex=$(( $activateindex + 1 ))
+              ;;
+              $(($VNindex+2)))
+                  activatearray[$activateindex]=${VNarray[VNindex+2]}
+                  activateindex=$(( $activateindex + 1 ))
+              ;;
+              $(($VNindex+3)))
+                  activatearray[$activateindex]=${VNarray[VNindex+3]}
+                  activateindex=$(( $activateindex + 1 ))
+              ;;
+              $(($VNindex+4)))
+                  activatearray[$activateindex]=${VNarray[VNindex+4]}
+                  activateindex=$(( $activateindex + 1 ))
+              ;;
+              [nN])
+                  loop2=1
+              ;;
+              *)
+                  echo "Invalid number. try again or N"
+              ;;
+          esac
+          if [ $l1esponse == "0" ]; then
+            VNALL=1
+            loop2=1
+            activatearray=("${VNarray[@]}")
+            VNindex=$VNnumelements
+          fi
+        done
+    VNindex=$(( $VNindex+5 ))
+    if [ $VNindex -gt $VNnumelements ]; then loop1=1; fi
+  done
+  activateelements=${#activatearray[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(ask-VNs) K:(activateelements) $activateelements"; print-askVNs; fi
+}
+#####
+#
+# called by main() to allow the user to select which RZs to copy
+#
+#####
+ask-RZs(){
+  # copy ask-VNs. use the RZfromlist array. replace VN with RZ in variables
+  #      change "activate" variables to "RZactivate" variables
+  loop1=0
+  RZindex=0
+  RZarray=( $(echo "ALL,ALLID") )
+  RZarray+=("${RZfromlist[@]}")
+  RZnumelements=${#RZarray[@]}
+  RZactivateindex=0
+  RZALL=0
+  #
+  # show 5 Routing Zones at a time
+  #
+  while [ $loop1 -eq 0 ]
+  do
+    echo " Which Routing Zone you like to move:"
+    if [ $(($RZindex)) -lt $RZnumelements ]; then echo "   "$RZindex" "`echo ${RZarray[RZindex]} | cut -d',' -f1`; fi
+    if [ $(($RZindex+1)) -lt $RZnumelements ]; then echo "   "$(($RZindex+1))" "`echo ${RZarray[RZindex+1]} | cut -d',' -f1`; fi
+    if [ $(($RZindex+2)) -lt $RZnumelements ]; then echo "   "$(($RZindex+2))" "`echo ${RZarray[RZindex+2]} | cut -d',' -f1`; fi
+    if [ $(($RZindex+3)) -lt $RZnumelements ]; then echo "   "$(($RZindex+3))" "`echo ${RZarray[RZindex+3]} | cut -d',' -f1`; fi
+    if [ $(($RZindex+4)) -lt $RZnumelements ]; then echo "   "$(($RZindex+4))" "`echo ${RZarray[RZindex+4]} | cut -d',' -f1`; fi
+    echo "   N = Next set of RZs"
+    loop2=0
+    while [ $loop2 -eq 0 ]
+    do
+       read l1esponse
+          case $l1esponse in
+              $(($RZindex)))
+                  RZactivatearray[$RZactivateindex]=${RZarray[RZindex]}
+                  RZactivateindex=$(( $RZactivateindex + 1 ))
+              ;;
+              $(($RZindex+1)))
+                  RZactivatearray[$RZactivateindex]=${RZarray[RZindex+1]}
+                  RZactivateindex=$(( $RZactivateindex + 1 ))
+              ;;
+              $(($RZindex+2)))
+                  RZactivatearray[$RZactivateindex]=${RZarray[RZindex+2]}
+                  RZactivateindex=$(( $RZactivateindex + 1 ))
+              ;;
+              $(($RZindex+3)))
+                  RZactivatearray[$RZactivateindex]=${RZarray[RZindex+3]}
+                  RZactivateindex=$(( $RZactivateindex + 1 ))
+              ;;
+              $(($RZindex+4)))
+                  RZactivatearray[$RZactivateindex]=${RZarray[RZindex+4]}
+                  RZactivateindex=$(( $RZactivateindex + 1 ))
+              ;;
+              [nN])
+                  loop2=1
+              ;;
+              *)
+                  echo "Invalid number. try again or N"
+              ;;
+          esac
+          if [ $l1esponse == "0" ]; then
+            RZALL=1
+            loop2=1
+            RZactivatearray=("${RZarray[@]}")
+            RZindex=$RZnumelements
+          fi
+        done
+    RZindex=$(( $RZindex+5 ))
+    if [ $RZindex -gt $RZnumelements ]; then loop1=1; fi
+  done
+  RZactivateelements=${#RZactivatearray[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(ask-RZs) K:(RZactivateelements) $RZactivateelements"; print-askRZs; fi
+}
+#####
+#
+# called by main() to copy the RZs from the FROM BP to the TO BP
+#
+#####
+do-RZcopy(){
+  echo " Copying all \"FROM\" Blueprint Routing Zones into \"TO\" Blueprint"
+  if [[ $ToVersion == "4.1"* ]]; then
+      # Starting with 4.1 of Apstra, route policies have changed. Point to
+      #    default policy for all RZs being copied over
+      default_route_policy=`curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/blueprints/${toBPUUID}/routing-policies |
+        jq '.items[] | select(.label=="Default_immutable") | .id' | sed 's/"//g'`
+  fi
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-RZcopy) K:(fromBPname) $fromBPname  K:(fromBPUUID) $fromBPUUID  K:(toBPname) $toBPname  K:(toBPUUID) $toBPUUID"; fi
+  rzout=`curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/blueprints/${fromBPUUID}/security-zones | jq -rc '.items[]' | awk '{printf("%s~~\n",$0)}'`
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-RZcopy) K:(fromBPname) $fromBPname  K:(rzout) $rzout"; fi
+  for row in `echo $rzout | tr -d '\n\r' | awk 'BEGIN {FS=","; RS="}~~"} $0!~/Default/ {printf("%s,%s,%s,%s,%s,%s,\"sz_type\":\"evpn\"}\n",$1,$2,$4,$5,$6,$NF)}'`; do
+    # logic to copy ALL RZs
+    if [[ $ToVersion == "4.1"* ]]; then
+      # modify the routing_policy_id if >= 4.1
+      row=`echo $row | jq -rc --arg default "$default_route_policy" '.routing_policy_id = $default'`
+    fi
+    if [ $RZALL -eq 1 ]; then
+      if [ $DEBUG -eq 1 ]; then output-debug "R:(do-RZcopy) K:(fromBPname) $fromBPname  K:(RZALL) ALL  K:(row) $row"; fi
+      curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X POST https://$AOSToIP/api/blueprints/${toBPUUID}/security-zones --data-raw `echo $row`
+    else
+      # logic to only copy RZs selected
+      if [ $DEBUG -eq 1 ]; then output-debug "R:(do-RZcopy) K:(fromBPname) $fromBPname  K: (RZALL) Select  K:(row) $row"; fi
+      for ((ij=0;ij<$RZactivateelements;ij++)); do
+        RZname=`echo ${RZactivatearray[ij]} | awk -F',' '{print $1}'`
+        found=`echo $row | grep $RZname`
+        if [ ! -z "$found" ]; then
+          curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X POST https://$AOSToIP/api/blueprints/${toBPUUID}/security-zones --data-raw `echo $row`
+        fi
+      done
+    fi
+    echo " "
+  done
+}
+#####
+#
+# called by main() to copy modified FROM BP VNs to the TO BP
+#
+#####
+do-VNcopy(){
+  echo " Applying Virtual Networks to the \"TO\" Blueprint"
+  echo " "
+  echo " NOTE: Virtual Networks MUST be bound to at least 1 Rack to be instantiated"
+  echo "       A randomly selected Rack in the \"TO\" Blueprint will be used."
+  echo "       All applied Virtual Networks will be bound to Rack ...${RACKStolist[1]}..."
+  echo "       You can change the binding via the GUI."
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(do-VNcopy) K:(toBPname) $toBPname  K:(toBPUUID) $toBPUUID"; fi
+  # Based on ask-VNs response, either copy all VNs or only select VNs
+  if [ $VNALL -eq 1 ]; then
+    # copy all VNs
+    if [ $DEBUG -eq 1 ]; then output-debug "R:(do-VNcopy) K:(activatearray[]) ALL"; fi
+    for row in `cat /tmp/VNlistmod`; do
+      # future - RZ select logic
+      #          if dummy string found in UUID, /dev/null
+      #                                         echo message VN can not be copied
+      if [ $DEBUG -eq 1 ]; then echo "DEBUG: R:(do-VNcopy) K:(ENTRY) ${row}"; fi
+      do-VNcopy-curl
+    done
+  else
+    # copy selected VNs
+    for ((ij=0;ij<$activateelements;ij++)); do
+      for row in `cat /tmp/VNlistmod | grep "${activatearray[ij]}"`; do
+        if [ $DEBUG -eq 1 ]; then output-debug "R:(do-VNcopy) K:(activatearray[]) ${activatearray[ij]}"; fi
+        do-VNcopy-curl
+      done
+    done
+  fi
+}
+#####
+#
+# called by do-VNcopy() to strip the string _BPSF_ from each VN TO UUID
+#
+#####
+do-VNcopy-curl(){
+  # if the TO RZ UUID has _BPSF_ appended to it then
+  #        strip off _BPSF_ and copy the VN into the TO BP
+  #        else print a message that the VN can't be copied because the VRF it
+  #             belonged into in the FROM BP was not copied into the TO BP
+  if [ $DEBUG -eq 1 ]; then echo "DEBUG: R:(do-VNcopy) K:(ENTRY) ${row}"; fi
+  found=`echo $row | grep '_BPSF_'`
+  if [ ! -z "$found" ]; then
+    # strip the found string
+    row=`echo $row | sed 's/_BPSF_//g'`
+    curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X POST https://$AOSToIP/api/blueprints/${toBPUUID}/virtual-networks --data-raw `echo $row`
+    echo " "
+  else
+    echo " Virtual Network `echo $row | jq -r '.label'` can not be copied because VRF doesn't exist in the TO Blueprint"
+  fi
+}
+#####
+#
+# called by main() to retrieve all Configets defined in the From Apstra Server
+#
+#####
+get-FromCNFs(){
+  echo " Getting all \"FROM\" Apstra Server Configlets"
+  curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/design/configlets |
+  jq -rc '.items[] | del(.id)' | sed -e 's|\\|\\\\|g' > /tmp/FromBPCNFs
+  CNFfromlist=( $(curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/design/configlets |
+  jq -rc '.items[] | .display_name' | sed -e 's/ /~/g') )
+  CNFfromlistelements=${#CNFfromlist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-FromCNFs) K:(CNFfromlistelements) $CNFfromlistelements"; print-CNFfromlist; fi
+}
+#####
+#
+# called by main() to retrieve all pre-existing Configets defined in the to Apstra Server
+#
+#####
+get-ToCNFs(){
+  echo " Getting all \"To\" pre-existing Apstra Server Configlets"
+  CNFtolist=( $(curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/design/configlets |
+  jq -rc '.items[] | .display_name' | sed -e 's/ /~/g') )
+  CNFtolistelements=${#CNFtolist[@]}
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-ToCNFs) K:(CNFtolistelements) $CNFtolistelements"; print-CNFtolist; fi
+}
+#####
+#
+# called by main() create a list of unique configlets to copy
+#
+#####
+do-CNFunique(){
+  echo " Determining Unique configlets to copy"
+  # if the configlet exists in both From and To, add to the string UniqueSED
+  for juniq in "${CNFfromlist[@]}"; do
+    if [[ " ${CNFtolist[@]} " =~ " $juniq " ]]; then
+        UniqueSED+="/$juniq/d; "
+    fi
+  done
+  # remove "; " from the end of the string
+  UniqueSED="${UniqueSED%; }"
+  # change the ~ added in get-FromCNFs and get-ToCNFs back to space
+  UniSEDorg=`echo $UniqueSED | sed 's/~/ /g'`
+  # Delete any From Configlet that is a pre-existing To Configlet based on name
+  sed -i '' "$UniSEDorg" /tmp/FromBPCNFs
+}
+#####
+#
+# called by main() to copy Unique Configets defined in the From Apstra Server
+#        to the To Apstra server
+#
+#####
+do-ToCNFcopy(){
+  echo " Copying Unique \"From\" Apstra Server Configets into the \"To\" Apstra Server"
+  cat /tmp/FromBPCNFs | while read row
+  do
+    echo $row > /tmp/CNFtmp
+    curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X POST https://$AOSToIP/api/design/configlets --data-binary @/tmp/CNFtmp
+  done
+  echo " "
+}
+#####
+#
+# called by main() to get each Configlet entry from the FROM BP
+#    only "role" configlets are supported
+#
+#####
+get-CNFfromlist(){
+  # because of how the configlet stores the statements that are applied to a device
+  #    the string needs to be manipulated and stored in a file
+  #
+  # jq 1 - strip entries from the "items" array and put back configlets into a direct array
+  # jq 2 - if the configlet is not using "role in" condition, /dev/null it
+  # awk  - strip off all the non-"role in" condition information
+  # jq 3 - put entries into an array
+  # jq 4 - delete the "id" field from each entry
+  # sed  - because of how the configlet stories config statement, the escapes have to be escaped
+  echo " Getting all \"FROM\" Blueprint Configlets"
+  echo " "
+  echo " NOTE:"
+  echo "     Configlets that do not use the condition \"role in\" will not be copied"
+  echo "     Configlets that use multiple conditions will only have the \"role in\" copied"
+  echo " "
+  if [ $DEBUG -eq 1 ]; then output-debug "R:(get-CNFfromlist) K:(fromBPname) $fromBPname  K:(fromBPUUID) $fromBPUUID"; fi
+  curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/blueprints/${fromBPUUID}/configlets |
+  jq '[.items[]]' | jq '.[] | select(.condition | contains("role"))' | awk '/"condition/ {s=index($0, "role"); l=length($0); print "  \"condition\": \""substr($0,s,l); next};{print $0}' |
+  jq '[.]' | jq -c '.[] | del(.id)' | sed -e 's|\\|\\\\|g' > /tmp/CNFfromlist
+}
+#####
+#
+# called by main() to stuff each Configlet entry into the TO BP
+#
+#####
+do-CNFtolist(){
+  # because of how the configlet stores the statements that are applied to a device
+  #    each record needs to be placed in a tmp file because using the curl --data-raw
+  #    would require additional string processing and it's easier to use a tmp file
+  echo " Applying Configlets to the \"TO\" Blueprint"
+  cat /tmp/CNFfromlist | while read row
+  do
+    dplyname=`echo $row | awk '{d=index($0, "display_name"); c=index($0, ","); print substr($0,d+15,c-d-16)}'`
+    if [ $DEBUG -eq 1 ]; then echo "DEBUG: R:(do-CNFtolist) K:(dplyname) $dplyname"; fi
+    echo $row > /tmp/CNFtmp
+    curl -s -H "AuthToken: ${AOSTotoken}" -H "Content-Type: application/json" -k -X POST https://$AOSToIP/api/blueprints/${toBPUUID}/configlets --data-binary @/tmp/CNFtmp
+    echo " "
+  done
+}
+get-versions(){
+  echo " Getting \"FROM\" AOS version"
+  FromVersion=`curl -s -H "AuthToken: ${AOSFromtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSFromIP/api/version |
+    jq -rc '.version'`
+  echo " Getting \"TO\" AOS version"
+  ToVersion=`curl -s -H "AuthToken: ${AOSTOtoken}" -H "Content-Type: application/json" -k -X GET https://$AOSToIP/api/version |
+    jq -rc '.version'`
+  if [ $DEBUG -eq 1 ]; then echo "DEBUG: R:(get-versions) K:(FromVersion) $FromVersion  K:(ToVersion) $ToVersion"; fi
+}
+#####
+#
+# routines used for debugging
+#
+#####
+#  Called to output uniform DEBUG messages when -x arg is passed
+output-debug(){
+  local inputstr=$1
+  echo "DEBUG: $inputstr" 1>&2
+}
+# Called to dump the content of the RZfromlist array
+print-RZfromlist(){
+  echo "DEBUG: RZ FROM LIST"
+  for((ij=0;ij<$RZfromlistelements;ij++))
+  do
+    echo "DEBUG: RZ_FROM: ${RZfromlist[ij]}"
+  done
+}
+# Called to dump the content of the RZtolist array
+print-RZtolist(){
+  echo "DEBUG: RZ TO LIST"
+  for((ij=0;ij<$RZtolistelements;ij++))
+  do
+    echo "DEBUG: RZ_TO: ${RZtolist[ij]}"
+  done
+}
+# Called to dump the content of the CNFlist array
+print-CNFfromlist(){
+  echo "DEBUG: CN From LIST"
+  for((ij=0;ij<$CNFfromlistelements;ij++))
+  do
+    echo "DEBUG: CNF: ${CNFfromlist[ij]}"
+  done
+}
+# Called to dump the content of the CNTlist array
+print-CNFtolist(){
+  echo "DEBUG: CN To LIST"
+  for((ij=0;ij<$CNFtolistelements;ij++))
+  do
+    echo "DEBUG: CNF: ${CNFtolist[ij]}"
+  done
+}
+# Called to dump the content of the VNfromlist array
+print-askRZs(){
+  echo "DEBUG: ASK RZ LIST"
+  for((ij=0;ij<$RZactivateelements;ij++))
+  do
+    echo "DEBUG: VN: ${RZactivatearray[ij]}"
+  done
+}
+# Called to dump the content of the VNfromlist array
+print-askVNs(){
+  echo "DEBUG: ASK VN LIST"
+  for((ij=0;ij<$activateelements;ij++))
+  do
+    echo "DEBUG: VN: ${activatearray[ij]}"
+  done
+}
+# Called to dump the content of the VNfromlist array
+print-VNfromlist(){
+  echo "DEBUG: VN FROM LIST"
+  for((ij=0;ij<$VNfromlistelements;ij++))
+  do
+    echo "DEBUG: VN: ${VNfromlist[ij]}"
+  done
+}
+# Called to dump the single switch Racks found in "TO" BP
+print-RACKStolist(){
+  echo "DEBUG: RACKS TO LIST"
+  for((ij=0;ij<$RACKStolistelements;ij=ij+2))
+  do
+    echo "DEBUG: ID: ${RACKStolist[ij]}  NAME: ${RACKStolist[ij+1]}"
+  done
+}
+print-ToBPCNFs(){
+  echo "DEBUG: RACKS TO LIST"
+  for((ij=0;ij<$ToBPCNFselements;ij=ij+2))
+  do
+    echo "DEBUG: ID: ${ToBPCNFs[ij]}  NAME: ${ToBPCNFs[ij+1]}"
+  done
+}
+#####
+#
+# main()
+#
+#####
+do-args
+clear-json
+build-tokens
+get-tokens
+# get-versions
+get-BPlist
+get-BPFdetails
+get-BPTdetails
+get-VNfromlist
+get-RZfromlist
+ask-RZs
+do-RZcopy
+get-RZtolist
+do-RZcombine
+get-RACKStolist
+do-VNlistmod
+ask-VNs
+do-VNcopy
+get-FromCNFs
+get-ToCNFs
+do-CNFunique
+do-ToCNFcopy
+get-CNFfromlist
+do-CNFtolist
+
+if [ $DEBUG -eq 0 ]; then clear-json; fi
