@@ -13,11 +13,10 @@ be deployed. It does NOT have to have physical devices assigned. The source and
 destination Blueprints can be based on different Templates.
 
 
-<ul>CTcopy - copies Connectivity Templates. It does not copy interface assignments\
-           since the logical devices might use a different name.  Requires that\
-           the RVC tool has been used to copy Route_Zones and Virtual_Networks \
-           into the destination Blueprint.\
-<ul/>
+&nbsp;&nbsp;CTcopy - copies Connectivity Templates. It does not copy interface assignments\
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;since the logical devices might use a different name.  Requires that\
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;the RVC tool has been used to copy Route_Zones and Virtual_Networks \
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;into the destination Blueprint.\
 \
  eCTcopy - CTcopy for when the source Blueprint and destination Blueprint exist\
            on a different Apstra servers\
