@@ -19,14 +19,14 @@ destination Blueprints can be based on different Templates.
           into the destination Blueprint.
 
 eCTcopy - CTcopy for when the source Blueprint and destination Blueprint exist
-          on a different Apstra servers
+          on different Apstra servers
 
     RVC - copies Route_Zones, Virtual_Networks, and any applied Configlets from 
           the source Blueprint to the destination Blueprint. Route_Zones and 
           Virtual_Networks to copy are selectable.
 
    eRVC - RVC for when the source Blueprint and destination Blueprint exist on 
-          a different Apstra servers with the capability to copy all Configlets
+          different Apstra servers with the capability to copy all Configlets
           on the source Apstra server to the destination Apstra server. Each 
           configlet is checked to be non-exist on the destination Apstra server
           before coping it. The check is based configlet name.    
